@@ -36,6 +36,7 @@ Bluesky-QueueServer Documentation
 
    interacting_with_qs
    re_manager_api
+   experiment_controller_prototype
 
 .. toctree::
    :maxdepth: 1
