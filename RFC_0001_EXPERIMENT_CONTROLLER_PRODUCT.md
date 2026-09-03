@@ -63,6 +63,8 @@ Each instrument deployment MUST have exactly one active controller process. The 
 
 The worker remains a separate process; "one controller" does not mean executing Bluesky inside the controller process.
 
+The product MUST rely on the deployment's standard process supervisor rather than reproduce QueueServer's custom Manager Watchdog as a first-release subsystem. A controller-only death while its same-host worker and supervisor remain healthy is possible, but it is a narrow process-local failure rather than the primary availability model. Deterministic controller crashes, deadlocks, and dependency failures must be addressed through release testing and fixes; automatic restart is containment for residual faults, not a substitute for correctness.
+
 ### 3. Replace namespace access with a versioned operation catalog
 
 A worker deployment MUST publish an explicit catalog of operation descriptors. Each descriptor contains at least:
@@ -121,7 +123,7 @@ One persisted control lease grants time-bounded authority for queue mutation and
 
 Lease acquisition, renewal, expiry, handoff, revocation, and privileged override MUST be auditable. An expired lease prevents new mutations but MUST NOT rewrite ownership or the outcome of work that is already running. Detailed handoff, revocation, and administrative override semantics require a follow-up RFC before production use.
 
-### 7. Treat ambiguous execution outcomes conservatively
+### 7. Treat process loss and ambiguous execution conservatively
 
 The target lifecycle is explicit and durable:
 
@@ -135,11 +137,15 @@ submitted
 
 The first implementation MAY combine adjacent internal states while preserving their externally meaningful transitions. It MUST NOT report a running operation as completed merely because the controller or worker restarted.
 
-If transport is lost after an operation is claimed, the operation MUST become `unknown`, automatic dispatch MUST stop, and the operation MUST NOT be silently retried or requeued. Dispatch may resume only after worker reconciliation and an authenticated operator acknowledgement recorded as a controller event.
+Controller-process restart is not a normal execution path and does not promise uninterrupted queue processing. If the controller connection disappears while an operation is claimed or running, the worker MUST accept no new work. It MUST follow an orphan policy defined by the reviewed operation/runtime contract: finish the current operation, pause at a safe checkpoint, or request a safe stop. The parent RFC does not select one universal action because abruptly terminating a worker is not necessarily a safe hardware stop.
 
-An explicit retry is new operator intent. It MUST have an auditable identity and MUST NOT overwrite the unknown operation. The detailed relationship between an operation, execution attempts, and retries is deferred to the lifecycle/recovery RFC.
+The deployment supervisor MAY restart the controller. The restarted controller MUST load durable state and reconcile the operation UID, worker revision, and the worker session or execution-attempt identity defined by the lifecycle RFC. A proven match MAY allow the controller to resume observing the current operation. It MUST NOT silently authorize dispatch of the next queue item. The reconciliation decision and resulting state MUST be durably recorded before dispatch can resume.
 
-The prototype also blocks dispatch after an ordinary operation failure. A follow-up lifecycle RFC may make that policy dependent on a reviewed operation's failure classification, but ambiguous worker loss MUST always block.
+If the worker is absent, identities do not match, or the outcome cannot be proven, the operation MUST become `unknown` or `interrupted`, automatic dispatch MUST stop, and recovery MUST require an authenticated operator acknowledgement. Worker transport loss after claim is always such an ambiguous outcome unless a later reconciliation supplies authoritative evidence.
+
+An explicit retry is new operator intent. It MUST have an auditable identity and MUST NOT overwrite the unknown operation. The detailed relationship between an operation, execution attempts, worker sessions, and retries is deferred to the lifecycle/recovery RFC.
+
+The prototype also blocks dispatch after an ordinary operation failure. A follow-up lifecycle RFC may make that policy dependent on a reviewed operation's failure classification, but ambiguous process or transport loss MUST always block.
 
 ### 8. Expose one typed public API
 
@@ -163,11 +169,13 @@ Every conforming implementation MUST preserve these invariants:
 5. Queue and dispatch mutations use optimistic revision checks.
 6. A queue/dispatch mutation, its new revision, and its controller event commit in one transaction.
 7. Controller events have durable cursor IDs and are distinct from Bluesky documents.
-8. Worker transport loss after claim produces an unknown outcome and blocks further dispatch.
-9. Unknown work is never automatically retried, requeued, or declared successful.
-10. Recovery that restores dispatch is explicit, authenticated, and audited.
-11. The controller and worker do not bypass device, IOC, or facility safety interlocks.
-12. QueueServer and the new product never share live control authority during migration.
+8. Loss of the controller connection prevents the worker from accepting new work.
+9. Controller restart never implicitly authorizes dispatch of the next item; reconciliation is recorded first.
+10. Worker transport loss after claim produces an unknown outcome unless authoritative reconciliation proves otherwise.
+11. Unknown work is never automatically retried, requeued, or declared successful.
+12. Recovery that restores dispatch is explicit, authenticated, and audited.
+13. The controller and worker do not bypass device, IOC, or facility safety interlocks.
+14. QueueServer and the new product never share live control authority during migration.
 
 ## Prototype evidence
 
@@ -182,7 +190,7 @@ The internal prototype establishes that the smallest control path is feasible wi
 | Worker isolation | Separate interpreter process with strict request/response correlation and reported revision | Independently built worker artifact and deployment supervision |
 | Safe ambiguity | Transport loss records `unknown`, blocks dispatch, and requires acknowledgement | Worker reconciliation protocol and operator UX |
 | Bluesky correlation | Simulated RunEngine execution returns start-document run UIDs | Data-document routing and data-catalog integration boundary |
-| Restart evidence | Reopening the file-backed database returns the same terminal record and ordered events | Controller/worker crash matrix and supervised restart behavior |
+| Restart evidence | Reopening the file-backed database returns the same terminal record and ordered events | Standard process supervision, worker orphan policy, exact worker-session reconciliation, and a complete crash matrix |
 
 The reference implementation is intentionally narrower than this RFC. It uses a trusted subject string, runs the worker with the controller's interpreter, has no HTTP or SSE server, exposes one simulator operation, and supports no hardware.
 
@@ -225,6 +233,10 @@ Rejected. Package installation and source updates are deployment responsibilitie
 
 Rejected. Consensus, leadership, fencing, and distributed storage substantially expand the safety and operational model. One active controller is sufficient to validate the product and real workflows.
 
+### Preserve QueueServer's custom Watchdog and transparent continuation
+
+Rejected as a first-release requirement. The legacy topology can replace only the Manager while retaining its sibling Worker, but this mainly protects against a localized Manager defect or a signal directed at that process. The processes still share a host and usually a service or resource boundary, so this is not general host or deployment resilience. Known deterministic defects should be removed through testing, while residual failures should be contained by standard supervision and fail-closed reconciliation. Heuristically reconstructing state and continuing the queue hides ambiguity rather than resolving it.
+
 ### Add HTTP, authentication, and database frameworks to the prototype
 
 Rejected for the contract probe. The prototype first had to prove operation identity, durable transitions, worker isolation, and failure semantics. Production HTTP and identity integration remain required, but they should be built after this parent decision is reviewed.
@@ -246,6 +258,7 @@ Rejected for the contract probe. The prototype first had to prove operation iden
 - Each supported instrument workflow needs reviewed operation definitions.
 - Authentication, worker deployment, safe control actions, and data integration still require deliberate design.
 - A single-controller SQLite deployment does not provide HA.
+- A controller restart overlapping active work may stop queue progress and require reconciliation or operator action instead of continuing transparently.
 
 ## Migration posture
 
@@ -270,7 +283,7 @@ Accepting this RFC means agreement that:
 3. clients submit only explicit, versioned, schema-valid operations;
 4. the worker is a private, declared environment and reports its revision;
 5. controller state, revisions, leases, and controller events are durable and transactional;
-6. ambiguous execution outcomes block dispatch and require explicit audited recovery;
+6. controller restart does not imply transparent queue continuation, and ambiguous execution outcomes block dispatch until explicit audited recovery;
 7. public access will use a typed HTTPS/SSE boundary rather than direct ZMQ;
 8. the current prototype is evidence, not a production API commitment.
 
@@ -280,7 +293,7 @@ Acceptance does not approve hardware operation, production deployment, or the un
 
 1. Select one actual NSLS-II workflow and define its operation catalog, simulator, and acceptance scenarios.
 2. Specify operation registration, schema generation, logical device resolution, and worker SDK packaging.
-3. Specify lifecycle attempts, pause/stop/cancel semantics, worker reconciliation, and restart behavior.
+3. Specify execution attempts, worker-session identity, worker orphan policy, supervisor responsibilities, pause/stop/cancel semantics, reconciliation, and restart behavior.
 4. Specify HTTP resources, idempotency, errors, SSE event envelopes, and retention.
 5. Select authentication integration and define authorization, lease handoff, revocation, and override policy.
 6. Define immutable worker artifacts, deployment supervision, readiness, rollback, and provenance.

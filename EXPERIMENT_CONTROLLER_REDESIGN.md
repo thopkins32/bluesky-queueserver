@@ -123,6 +123,14 @@ This solves the core concern in [queueserver#365](https://github.com/bluesky/blu
 
 **Deployment updates are deployment operations.** The controller must not run `git pull`, `pixi install`, or arbitrary update hooks through its public API. A deployment selects an immutable worker artifact/environment revision; the worker reports that revision at startup.
 
+### Supervision and controller loss
+
+Do not carry forward the legacy custom Watchdog or transparent queue continuation after manager restart as a first-release requirement. A controller-only death while its same-host worker and supervisor remain healthy is a narrow process-local failure, typically caused by a controller logic/dependency defect or a signal directed at that process. Known deterministic causes belong in release testing and should be fixed, not normalized as an operating mode. Host, service, and broad resource failures are more likely to affect the complete deployment.
+
+Use the deployment's standard process supervisor to restart the controller. If the controller connection is lost, the worker must accept no new work and apply a documented orphan policy to the current operation: finish, pause at a safe boundary, or stop, depending on the reviewed operation/runtime contract.
+
+After restart, the controller reads durable state and reconciles the exact operation and worker-session identity. A proven match may allow it to resume observing that operation; it must not imply permission to dispatch the next item. A missing worker, mismatched identity, or unverifiable outcome becomes `unknown`, keeps dispatch blocked, and requires explicit operator recovery. Transparent continuation based only on surviving process memory is not a goal.
+
 ### Public API
 
 Use only:
@@ -199,14 +207,15 @@ submitted
 
 A worker restart must **never silently reinterpret** a running operation as completed.
 
-On controller or worker loss:
+Controller-process restart is not a normal execution path and does not promise uninterrupted queue processing. If a controller disappears while work is claimed or running:
 
-1. mark the execution attempt `unknown` or `interrupted`;
-2. stop automatic dispatch;
-3. require worker reconciliation and operator acknowledgement;
-4. only then allow new work.
+1. the worker accepts no new work and follows the operation's documented orphan policy;
+2. the deployment supervisor may restart the controller;
+3. the controller reconciles durable operation identity against the worker's exact session and execution identity;
+4. a proven match may resume observation of the current operation, but not automatic dispatch of another item;
+5. an absent worker, identity mismatch, or unverifiable outcome becomes `unknown` or `interrupted` and requires operator acknowledgement.
 
-Automatic recovery may restart a process. It must not automatically resume a possibly interrupted hardware operation.
+Worker or transport loss after claim always stops automatic dispatch. Recovery may restart a process, but it must not automatically retry, resume, or reinterpret a possibly interrupted hardware operation.
 
 ### Control actions
 
@@ -310,7 +319,8 @@ The first release should still prove one complete safe workflow. The prototype e
 | Execute against simulated devices | A subprocess runs Bluesky `count` with Ophyd simulated hardware and returns run UIDs | Exercise the selected facility workflow and independently deployed worker |
 | Stream durable lifecycle events | Ordered controller events support `after_event_id` resumption | Add authenticated SSE delivery, retention, and reconnect behavior |
 | Stop safely | Not implemented | Define and test request-stop, pause, cancellation, and safe-boundary behavior |
-| Restart controller or worker | Reopening SQLite preserves terminal records and events; worker transport loss is tested | Add process supervision and a worker reconciliation handshake |
+| Restart the controller | Reopening SQLite preserves terminal records and events | Use the deployment supervisor; define worker orphan behavior and exact-identity reconciliation. Transparent queue continuation is not a goal |
+| Recover worker loss | Worker transport loss is recorded as `unknown` and blocks dispatch | Add worker supervision, reconciliation, and safe operator recovery |
 | Require explicit recovery | Failed or unknown work blocks dispatch until acknowledged | Reconcile worker state and define authorized recovery actions |
 | Retain a complete audit trail | Actor-tagged lifecycle events commit with domain changes | Bind actors to authenticated principals and define audit retention/export |
 
