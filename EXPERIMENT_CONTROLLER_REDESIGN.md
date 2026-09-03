@@ -18,6 +18,24 @@ That changes the economics completely. The current architecture is expensive lar
 
 If those are not requirements, retaining them is negative value.
 
+## Current status
+
+As of 2026-09-03, the first internal contract prototype is implemented in this repository under [`src/bluesky_queueserver/_experiment_controller/`](src/bluesky_queueserver/_experiment_controller/). [RFC 0001](RFC_0001_EXPERIMENT_CONTROLLER_PRODUCT.md) now captures the parent product and architecture decision for review.
+
+The prototype proves:
+
+- a private, typed controller/worker contract with stable operation identity and explicit operation versions;
+- closed Draft 7 parameter validation before persistence or worker execution;
+- a file-backed SQLite WAL store for queue revision, operation lifecycle, one control lease, dispatch blocking, and cursorable controller events;
+- a strict private subprocess protocol and one trusted `simulated-count` operation using Ophyd simulated hardware and a fresh Bluesky RunEngine;
+- durable FIFO submission and dispatch, including terminal run UIDs;
+- conservative failure handling: operation failure or worker transport loss blocks dispatch, transport loss records `unknown`, and recovery requires an explicit acknowledgement;
+- restart persistence, stale-revision rejection, schema rejection without mutation, deterministic lease expiry, and subprocess cleanup in the [focused behavioral suite](src/bluesky_queueserver/tests/test_experiment_controller.py).
+
+The runnable surface and limitations are documented in the [prototype guide](docs/source/experiment_controller_prototype.rst). The prototype has no HTTP service, authentication integration, hardware support, public ZMQ, legacy compatibility layer, independent worker environment, safe stop controls, or production deployment claim.
+
+This implementation changes the sequencing risk, not the target architecture. It is a mergeable reference implementation inside the current distribution; the production product remains a separate-repository cutover so that legacy imports, protocols, and dependencies do not become accidental compatibility commitments.
+
 ## Product charter
 
 Build an **authenticated, auditable, single-instrument execution service**.
@@ -280,31 +298,32 @@ Avoid naming it `bluesky-queueserver` initially. This is a different product wit
 
 ## First production slice
 
-The first release should prove one complete safe workflow:
+The first release should still prove one complete safe workflow. The prototype establishes part of that path, but it does not satisfy the production boundary by itself.
 
-1. deploy a versioned worker environment;
-2. load an explicit operation catalog;
-3. authenticate an operator;
-4. acquire a control lease;
-5. submit one validated operation;
-6. execute it with a simulated device set;
-7. stream durable lifecycle events;
-8. stop safely;
-9. restart controller or worker;
-10. require explicit recovery for an interrupted operation;
-11. retain a complete audit trail.
+| Capability | Prototype evidence | Remaining production gap |
+|---|---|---|
+| Deploy a versioned worker environment | Worker reports `prototype-simulator-v1` across a separate process boundary | Build and supervise an immutable worker artifact in an environment independent of the controller |
+| Load an explicit operation catalog | `simulated-count` version `1` publishes a closed schema | Select one real NSLS-II workflow and define its reviewed catalog through a worker SDK |
+| Authenticate an operator | Trusted `subject` is carried through lease and events | Authenticate the caller and derive the subject at the public boundary |
+| Acquire a control lease | One lease is persisted with identity and expiry checks | Define handoff, revocation, privileged override, and operator UX |
+| Submit one validated operation | Catalog identity, revision, JSON representation, and schema are checked before mutation | Expose the contract through the typed public API |
+| Execute against simulated devices | A subprocess runs Bluesky `count` with Ophyd simulated hardware and returns run UIDs | Exercise the selected facility workflow and independently deployed worker |
+| Stream durable lifecycle events | Ordered controller events support `after_event_id` resumption | Add authenticated SSE delivery, retention, and reconnect behavior |
+| Stop safely | Not implemented | Define and test request-stop, pause, cancellation, and safe-boundary behavior |
+| Restart controller or worker | Reopening SQLite preserves terminal records and events; worker transport loss is tested | Add process supervision and a worker reconciliation handshake |
+| Require explicit recovery | Failed or unknown work blocks dispatch until acknowledged | Reconcile worker state and define authorized recovery actions |
+| Retain a complete audit trail | Actor-tagged lifecycle events commit with domain changes | Bind actors to authenticated principals and define audit retention/export |
 
-Only after that should the project add:
+The first production slice is complete only when every remaining gap above is resolved for one real workflow. Only after that should the project add:
 
 - reviewed submissions;
 - batch workflows;
 - richer operation catalogs;
-- data-document links;
-- facility-specific authorization;
+- data-document links beyond run-UID correlation;
 - additional worker types;
 - user-facing queue editors.
 
-That is a coherent real product. It is much smaller than current QueueServer while solving the parts that matter operationally.
+That remains a coherent, smaller product rather than a compatibility rebuild of current QueueServer.
 
 ## Migration posture
 
@@ -318,16 +337,20 @@ That is a coherent real product. It is much smaller than current QueueServer whi
 
 A clean migration is safer than attempting to run both products against one Redis namespace, worker, or instrument. They must never share live control authority.
 
-## Next
+## RFC sequence and next decision
 
-Create one parent RFC with this decision:
+[RFC 0001: Bluesky Experiment Controller Product Boundary](RFC_0001_EXPERIMENT_CONTROLLER_PRODUCT.md) is the draft parent RFC for this direction. It proposes:
 
 > **Replace QueueServer’s general remote-execution model with an explicitly incompatible, single-controller experiment-execution product.**
 
-Its first three accepted architecture decisions should be:
+Its foundational decisions are:
 
-1. one monorepo and one deployable controller;
-2. explicit operation catalog instead of remote Python/plan namespace access;
-3. durable transactional state plus auditable control lease, initially backed by SQLite on local persistent storage.
+1. one monorepo, one product version, and one active controller per instrument deployment;
+2. an explicit versioned operation catalog instead of remote Python or plan-namespace access;
+3. durable transactional state plus an auditable control lease, initially backed by SQLite on local persistent storage;
+4. a private worker process in a declared environment, with no public worker protocol or controller-managed package installation;
+5. conservative unknown-state recovery that never silently retries or reinterprets interrupted work.
 
-Then select **one actual NSLS-II workflow** to define the first operation catalog and simulator acceptance tests. That workflow—not legacy QueueServer surface area—should determine the first release boundary.
+Review and acceptance of RFC 0001 is the next architecture decision. Acceptance approves the product boundary and invariants, not production readiness or the prototype’s exact Python/stdio interfaces.
+
+After that decision, select **one actual NSLS-II workflow** to define the first operation catalog, simulator acceptance tests, safe control behavior, and deployment boundary. That workflow—not legacy QueueServer surface area—determines the first release.
