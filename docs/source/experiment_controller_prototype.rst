@@ -37,10 +37,17 @@ fresh Bluesky RunEngine inside the worker process. A later deployment may point
 the worker client at an independently built environment, but this prototype
 does not install, update, or manage that environment.
 
+The request loop blocks while the operation executes. It therefore provides no
+concurrent safe-stop channel, controller-liveness detection, orphan policy,
+worker-instance fencing, or execution-attempt identity. The production design
+requires those behaviors and does not reconnect to a surviving worker after a
+controller restart.
+
 A failed operation blocks further dispatch until an operator acknowledges the
 block. Loss of the worker transport leaves the stable operation record in the
 ``unknown`` state, also blocks dispatch, and never automatically retries or
-requeues the operation.
+requeues the operation. The prototype does not yet map every malformed or
+mismatched post-claim protocol response to that same fail-closed state.
 
 Deliberate exclusions
 =====================

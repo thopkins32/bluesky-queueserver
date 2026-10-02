@@ -11,7 +11,7 @@
 
 ## Abstract
 
-This RFC proposes replacing QueueServer's general remote-execution model with an explicitly incompatible, single-controller experiment-execution product. The new product will use one monorepo and one product version, a declared and versioned operation catalog instead of remote Python namespace access, a private worker-process boundary, and durable transactional state with an auditable control lease.
+This RFC proposes replacing QueueServer's general remote-execution model with an explicitly incompatible, single-controller experiment-execution product. The new product will use one monorepo and one product version, a declared and versioned operation catalog instead of remote Python namespace access, a private and subordinate worker-process boundary for dependency and failure isolation, and durable transactional state with an auditable control lease.
 
 The existing QueueServer remains available to current users and receives maintenance appropriate to that product. The new controller does not inherit QueueServer's public ZMQ protocol, interactive kernel access, arbitrary script or function execution, Redis queue model, profile-loading semantics, or CLI compatibility.
 
@@ -22,8 +22,9 @@ This parent RFC fixes the product boundary and core invariants. It does not stan
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** describe requirements on the proposed product.
 
 - **Controller**: the sole owner of durable queue state, authorization decisions, scheduling, worker lifecycle, and controller events for one instrument deployment.
-- **Worker**: a trusted process running a declared instrument environment and a reviewed operation catalog.
+- **Worker**: a trusted, disposable execution process running a declared instrument environment and reviewed operation catalog. It owns RunEngine and device objects while executing controller-authorized work, but owns no durable queue, authorization policy, public API, or recovery authority.
 - **Operation**: a versioned, typed action submitted to the controller. It is not an arbitrary Python function call.
+- **Execution attempt**: one controller-authorized invocation of an operation. Every retry creates a new attempt identity and never overwrites evidence from an earlier attempt.
 - **Controller event**: a durable lifecycle or audit record such as `operation.started`. It is not a Bluesky Event document.
 - **Bluesky document**: a RunEngine document such as `start`, `descriptor`, `event`, or `stop`.
 - **Control lease**: persisted, time-bounded authority held by one authenticated principal for queue mutation and execution control.
@@ -61,9 +62,15 @@ The initial product MUST use one repository and one product version for the prot
 
 Each instrument deployment MUST have exactly one active controller process. The first release will not support active-active controllers, horizontal web workers that share mutable controller state, or distributed scheduling. A later HA design requires a separate RFC and a storage/leadership model that preserves the invariants in this document.
 
-The worker remains a separate process; "one controller" does not mean executing Bluesky inside the controller process.
+Bluesky and Ophyd execution MUST remain in a separate worker process. This boundary exists because the controller and instrument stack have different dependency and failure domains: a worker package conflict, native-library failure, memory leak, or blocked operation must not also own or corrupt the durable control plane. The boundary also lets a deployment select an instrument environment without importing that environment into the public controller process.
 
-The product MUST rely on the deployment's standard process supervisor rather than reproduce QueueServer's custom Manager Watchdog as a first-release subsystem. A controller-only death while its same-host worker and supervisor remain healthy is possible, but it is a narrow process-local failure rather than the primary availability model. Deterministic controller crashes, deadlocks, and dependency failures must be addressed through release testing and fixes; automatic restart is containment for residual faults, not a substitute for correctness.
+The process split MUST NOT be represented as a physical-safety mechanism, an HA design, or—when both processes run as the same operating-system principal—a security sandbox. Hardware interlocks remain authoritative, and stronger containment requires deployment-level credentials or operating-system isolation.
+
+The worker is subordinate to the controller and disposable. Only the controller owns durable state and public authority; the worker has no queue, authentication surface, database, or public endpoint. The first release MUST NOT reproduce QueueServer's independently recoverable Manager/Worker topology or promise transparent continuation across controller restart.
+
+The product MUST rely on the deployment's standard process supervisor rather than reproduce QueueServer's custom Manager Watchdog. A controller-only death is a narrow process-local failure, not the primary availability model. Deterministic controller crashes, deadlocks, and dependency failures must be addressed through release testing and fixes; automatic restart is containment for residual faults, not a substitute for correctness.
+
+The deployment supervisor MUST NOT independently restart a worker. Only the controller may launch a worker, and only after it has established that no previous worker retains execution authority.
 
 ### 3. Replace namespace access with a versioned operation catalog
 
@@ -82,7 +89,7 @@ The public API MUST NOT accept Python expressions, arbitrary function names, upl
 
 ### 4. Keep the worker protocol private and the environment declared
 
-The controller MUST launch a configured worker command without a shell. The worker command selects a deployed, reviewed environment; the controller MUST NOT install packages, update Git repositories, invoke environment managers, or run arbitrary deployment hooks through its public API.
+The controller MUST launch a configured worker command without a shell. The command selects a deployed, reviewed environment; the controller MUST NOT install packages, update Git repositories, invoke environment managers, or run arbitrary deployment hooks through its public API.
 
 At startup, the worker MUST report:
 
@@ -90,11 +97,13 @@ At startup, the worker MUST report:
 - its worker revision;
 - its operation catalog.
 
-The controller MUST reject unsupported protocol versions, malformed responses, and duplicate operation identities before accepting submissions. Request correlation identifiers MUST be preserved across the private boundary.
+The controller MUST reject unsupported protocol versions, malformed responses, and duplicate operation identities before accepting submissions. Every dispatch MUST carry the stable operation UID, a new execution-attempt identity, and a request correlation identifier across the private boundary.
 
-The worker protocol is private implementation detail. It MUST NOT be exposed as a public network API. The exact newline-delimited JSON protocol used by the prototype is evidence that the process boundary works, not a commitment that the production transport can never change.
+The worker MUST service a private control and liveness path while an operation is executing. A blocking execute request/response loop that cannot concurrently receive a stop request or detect controller loss is insufficient for production. The detailed transport is private implementation detail and MUST NOT be exposed as a public network API.
 
-The production controller SHOULD remain import-independent of Bluesky, Ophyd, and instrument startup packages. Those dependencies belong in the declared worker environment.
+A malformed response, timeout, EOF, process exit, or correlation failure after an operation is claimed is an ambiguous execution outcome and MUST be handled according to Section 7. The exact newline-delimited JSON protocol used by the prototype proves only that a subprocess boundary works; it is not the production protocol commitment.
+
+The production controller SHOULD remain import-independent of Bluesky, Ophyd, and instrument startup packages. Those dependencies belong in the declared worker environment. The worker boundary does not replace authentication or operating-system isolation at the public or deployment boundary.
 
 ### 5. Make controller state transactional and durable
 
@@ -135,17 +144,19 @@ submitted
   -> succeeded | failed | cancelled | aborted | interrupted | unknown
 ```
 
-The first implementation MAY combine adjacent internal states while preserving their externally meaningful transitions. It MUST NOT report a running operation as completed merely because the controller or worker restarted.
+The first implementation MAY combine adjacent internal states while preserving their externally meaningful transitions. Before contacting the worker, the controller MUST durably record a new execution-attempt identity, the claim, the acting principal, the worker revision, and the corresponding controller event. It MUST NOT report a running operation as completed merely because either process restarted.
 
-Controller-process restart is not a normal execution path and does not promise uninterrupted queue processing. If the controller connection disappears while an operation is claimed or running, the worker MUST accept no new work. It MUST follow an orphan policy defined by the reviewed operation/runtime contract: finish the current operation, pause at a safe checkpoint, or request a safe stop. The parent RFC does not select one universal action because abruptly terminating a worker is not necessarily a safe hardware stop.
+After claim, any transport failure, protocol failure, timeout, process exit, or missing response that makes the outcome unprovable MUST record the attempt as `unknown` or `interrupted`, block automatic dispatch, and require authenticated operator recovery. It MUST NOT automatically retry, requeue, or declare the attempt successful.
 
-The deployment supervisor MAY restart the controller. The restarted controller MUST load durable state and reconcile the operation UID, worker revision, and the worker session or execution-attempt identity defined by the lifecycle RFC. A proven match MAY allow the controller to resume observing the current operation. It MUST NOT silently authorize dispatch of the next queue item. The reconciliation decision and resulting state MUST be durably recorded before dispatch can resume.
+If the controller connection disappears while an attempt is claimed or running, the worker MUST accept no new work. It MUST apply the reviewed operation's fixed orphan policy—finish the current operation, request a safe stop, or reach another explicitly defined safe terminal condition—and then exit. The worker's control/liveness path MUST be able to detect controller loss while execution is active. Abruptly terminating a worker is not assumed to be a safe hardware stop.
 
-If the worker is absent, identities do not match, or the outcome cannot be proven, the operation MUST become `unknown` or `interrupted`, automatic dispatch MUST stop, and recovery MUST require an authenticated operator acknowledgement. Worker transport loss after claim is always such an ambiguous outcome unless a later reconciliation supplies authoritative evidence.
+The first release MUST NOT reconnect to a surviving worker or resume observing its in-memory execution after controller restart. A restarted controller MUST load any claimed or running attempt, record it as `unknown` or `interrupted`, keep dispatch blocked, and expose the condition for operator recovery. It MUST NOT launch a replacement worker until the previous worker's execution authority is proven to have ended. An acknowledgement alone is not proof that the prior worker is gone.
 
-An explicit retry is new operator intent. It MUST have an auditable identity and MUST NOT overwrite the unknown operation. The detailed relationship between an operation, execution attempts, worker sessions, and retries is deferred to the lifecycle/recovery RFC.
+The deployment supervisor MAY restart the controller, but restart does not authorize queue continuation. The worker-exit evidence, fail-closed state transition, recovery acknowledgement, and any subsequent worker launch MUST be durably auditable. A future proposal for reconnectable workers would require a separate RFC with a stronger identity, result-recovery, and fencing model.
 
-The prototype also blocks dispatch after an ordinary operation failure. A follow-up lifecycle RFC may make that policy dependent on a reviewed operation's failure classification, but ambiguous process or transport loss MUST always block.
+An explicit retry is new operator intent. It MUST receive a new auditable execution-attempt identity and MUST NOT overwrite the unknown operation or attempt. The detailed relationship between operations and attempts remains part of the lifecycle follow-up design.
+
+The prototype also blocks dispatch after an ordinary operation failure. A follow-up lifecycle RFC may make that policy dependent on a reviewed operation's failure classification, but ambiguous process or protocol loss MUST always block.
 
 ### 8. Expose one typed public API
 
@@ -166,16 +177,20 @@ Every conforming implementation MUST preserve these invariants:
 2. Public callers can request only catalog-declared, schema-valid operations.
 3. The controller never evaluates caller-supplied Python or traverses a worker namespace.
 4. Every operation has one stable UID and records its submitted parameters, actor, operation version, and worker revision.
-5. Queue and dispatch mutations use optimistic revision checks.
-6. A queue/dispatch mutation, its new revision, and its controller event commit in one transaction.
-7. Controller events have durable cursor IDs and are distinct from Bluesky documents.
-8. Loss of the controller connection prevents the worker from accepting new work.
-9. Controller restart never implicitly authorizes dispatch of the next item; reconciliation is recorded first.
-10. Worker transport loss after claim produces an unknown outcome unless authoritative reconciliation proves otherwise.
-11. Unknown work is never automatically retried, requeued, or declared successful.
-12. Recovery that restores dispatch is explicit, authenticated, and audited.
-13. The controller and worker do not bypass device, IOC, or facility safety interlocks.
-14. QueueServer and the new product never share live control authority during migration.
+5. Every dispatch has a durable execution-attempt identity before the worker is contacted.
+6. Queue and dispatch mutations use optimistic revision checks.
+7. A queue/dispatch mutation, its new revision, and its controller event commit in one transaction.
+8. Controller events have durable cursor IDs and are distinct from Bluesky documents.
+9. The worker owns no durable control state and accepts work only from its controller connection.
+10. Loss of the controller connection prevents new work, invokes the fixed orphan policy, and ends that worker's authority.
+11. The first release never reconnects to or resumes observing a surviving worker after controller restart.
+12. A claimed or running attempt found after controller restart becomes `unknown` or `interrupted`, and dispatch remains blocked.
+13. A replacement worker cannot start until the previous worker's execution authority is proven to have ended.
+14. Any post-claim transport or protocol failure that makes the result unprovable produces an unknown outcome.
+15. Unknown work is never automatically retried, requeued, or declared successful.
+16. Recovery that restores dispatch is explicit, authenticated, and audited.
+17. The controller and worker do not bypass device, IOC, or facility safety interlocks.
+18. QueueServer and the new product never share live control authority during migration.
 
 ## Prototype evidence
 
@@ -185,14 +200,14 @@ The internal prototype establishes that the smallest control path is feasible wi
 |---|---|---|
 | Typed contract | Frozen dataclasses, explicit states and errors, Draft 7 input validation | Select the production schema/model generation strategy |
 | Explicit catalog | One `simulated-count` operation, version `1`, with a closed parameter schema | Define one real instrument workflow and worker SDK |
-| Durable state | Versioned SQLite schema, WAL mode, queue revisions, stable operation records, append-only events | Migration tooling, backup guidance, production operational limits |
-| Control lease | Persisted lease checked on submission, dispatch, and recovery | Authenticated principal integration, handoff, revocation, override |
-| Worker isolation | Separate interpreter process with strict request/response correlation and reported revision | Independently built worker artifact and deployment supervision |
-| Safe ambiguity | Transport loss records `unknown`, blocks dispatch, and requires acknowledgement | Worker reconciliation protocol and operator UX |
-| Bluesky correlation | Simulated RunEngine execution returns start-document run UIDs | Data-document routing and data-catalog integration boundary |
-| Restart evidence | Reopening the file-backed database returns the same terminal record and ordered events | Standard process supervision, worker orphan policy, exact worker-session reconciliation, and a complete crash matrix |
+| Durable state | Versioned SQLite schema, WAL mode, queue revisions, stable operation records, append-only events | Add execution attempts, migration tooling, backup guidance, and production operational limits |
+| Control lease | Persisted lease checked on submission, dispatch, and recovery | Add authenticated principal integration, handoff, revocation, and override |
+| Worker isolation | Separate interpreter process with strict request/response correlation and reported revision | Build an independent immutable worker artifact and add concurrent control/liveness, orphan exit, and execution-authority fencing |
+| Safe ambiguity | Transport loss records `unknown`, blocks dispatch, and requires acknowledgement | Treat every post-claim protocol failure consistently and define the operator recovery UX |
+| Bluesky correlation | Simulated RunEngine execution returns start-document run UIDs | Define the data-document routing and data-catalog boundary |
+| Restart evidence | Reopening the file-backed database returns the same terminal record and ordered events | Add fail-closed handling of nonterminal attempts, prohibit worker reattachment, prove prior-worker exit, and exercise the complete crash matrix |
 
-The reference implementation is intentionally narrower than this RFC. It uses a trusted subject string, runs the worker with the controller's interpreter, has no HTTP or SSE server, exposes one simulator operation, and supports no hardware.
+The reference implementation is intentionally narrower than this RFC. It uses a trusted subject string, runs the worker with the controller's interpreter, has a blocking request/response loop with no concurrent control or liveness path, has no HTTP or SSE server, exposes one simulator operation, and supports no hardware.
 
 ## Non-goals
 
@@ -207,6 +222,7 @@ The first product release will not provide:
 - direct PV mutation or monitoring outside declared operations;
 - a Bluesky document store or data catalog;
 - active-active controllers or SQLite over NFS;
+- reconnecting to or resuming observation of a surviving worker after controller restart;
 - a replacement for EPICS, device, PLC, or facility safety interlocks.
 
 An offline archival export tool MAY be designed later. It MUST NOT become a runtime compatibility bridge or a second live control path.
@@ -229,13 +245,19 @@ Rejected for the initial single-controller product. SQLite provides transactions
 
 Rejected. Package installation and source updates are deployment responsibilities. Exposing them through the controller would recreate arbitrary remote execution with deployment credentials.
 
+### Run Bluesky inside the controller process
+
+Rejected for the initial production architecture. A single process with a dedicated execution thread would remove IPC and independent-lifecycle failures, but it would also place the public API, durable state owner, beamline dependencies, native libraries, and operation execution in one failure and dependency domain. The separate worker is retained only for dependency and failure containment; it is not presented as a security sandbox, HA mechanism, or physical-safety boundary.
+
+This decision should be re-examined if the selected workflow demonstrates that the controller and instrument environments can be deployed together and that whole-service failure has acceptable operational consequences. The product MUST NOT maintain both in-process and subprocess production modes merely for optionality.
+
 ### Add HA and multiple active controllers immediately
 
 Rejected. Consensus, leadership, fencing, and distributed storage substantially expand the safety and operational model. One active controller is sufficient to validate the product and real workflows.
 
-### Preserve QueueServer's custom Watchdog and transparent continuation
+### Preserve QueueServer's custom Watchdog or transparent continuation
 
-Rejected as a first-release requirement. The legacy topology can replace only the Manager while retaining its sibling Worker, but this mainly protects against a localized Manager defect or a signal directed at that process. The processes still share a host and usually a service or resource boundary, so this is not general host or deployment resilience. Known deterministic defects should be removed through testing, while residual failures should be contained by standard supervision and fail-closed reconciliation. Heuristically reconstructing state and continuing the queue hides ambiguity rather than resolving it.
+Rejected. The legacy topology attempts to replace the Manager while retaining and reconnecting to its sibling Worker. That protects mainly against a localized Manager defect while introducing independent-lifetime, identity, and reconciliation failure modes. The new worker is a subordinate execution capsule: after controller loss it follows its fixed orphan policy and exits, and the restarted controller fails closed instead of reconstructing or continuing the prior execution.
 
 ### Add HTTP, authentication, and database frameworks to the prototype
 
@@ -245,9 +267,10 @@ Rejected for the contract probe. The prototype first had to prove operation iden
 
 ### Benefits
 
-- A smaller public attack surface and explicit trust boundary.
+- A smaller public attack surface and explicit code/dependency boundary.
+- Durable controller state and operator visibility survive an ordinary worker failure.
 - Reproducible operation and worker version attribution.
-- Durable concurrency and recovery semantics instead of inferred process state.
+- Durable concurrency and fail-closed recovery semantics instead of inferred process state.
 - One source of truth for controller contracts and releases.
 - A migration path that does not destabilize current QueueServer users.
 
@@ -256,9 +279,10 @@ Rejected for the contract probe. The prototype first had to prove operation iden
 - Existing QueueServer clients and queues are not directly compatible.
 - Facilities must deploy and operate a separate product and state store.
 - Each supported instrument workflow needs reviewed operation definitions.
+- The worker boundary requires a private protocol, concurrent control/liveness handling, process supervision, execution-attempt records, orphan behavior, and fencing.
 - Authentication, worker deployment, safe control actions, and data integration still require deliberate design.
 - A single-controller SQLite deployment does not provide HA.
-- A controller restart overlapping active work may stop queue progress and require reconciliation or operator action instead of continuing transparently.
+- A controller restart overlapping active work stops queue progress and requires explicit operator recovery; the first release does not reconnect to the old worker.
 
 ## Migration posture
 
@@ -270,9 +294,11 @@ Migration tooling, if required, should export historical information offline. It
 
 This controller is an execution coordinator, not a physical safety system. Hardware and facility interlocks remain authoritative. Operation code MUST use supported Bluesky/Ophyd and facility control surfaces and MUST NOT bypass server-side validation or interlocks.
 
-A production threat model must cover authentication, authorization, lease theft, replay, stale revisions, worker impersonation, local IPC access, database file permissions, event retention, secrets, denial of service, and deployment artifact provenance. The prototype demonstrates none of those controls beyond lease state, strict private framing, and deterministic failure handling.
+A worker process running on the same host and as the same operating-system principal as the controller is not a security sandbox. If compromise containment is required, the deployment must add distinct credentials, filesystem and network permissions, or an operating-system isolation boundary. The application-level process split is justified by dependency and failure containment, not by an unsupported security claim.
 
-No hardware pilot may begin until authenticated identity, facility authorization, reviewed operations, safe stop behavior, worker recovery, and deployment ownership are defined and exercised against simulation or a test IOC.
+A production threat model must cover authentication, authorization, lease theft, replay, stale revisions, worker impersonation, local IPC access, database file permissions, event retention, secrets, denial of service, and deployment artifact provenance. The prototype demonstrates none of those controls beyond lease state, strict private framing, and deterministic transport-failure handling.
+
+No hardware pilot may begin until authenticated identity, facility authorization, reviewed operations, safe stop behavior, worker orphan behavior, execution-authority fencing, operator recovery, and deployment ownership are defined and exercised against simulation or a test IOC.
 
 ## Acceptance criteria for this RFC
 
@@ -281,21 +307,22 @@ Accepting this RFC means agreement that:
 1. the new system is an incompatible product, not QueueServer v2 compatibility work;
 2. one monorepo and one active controller per instrument are the initial deployment model;
 3. clients submit only explicit, versioned, schema-valid operations;
-4. the worker is a private, declared environment and reports its revision;
-5. controller state, revisions, leases, and controller events are durable and transactional;
-6. controller restart does not imply transparent queue continuation, and ambiguous execution outcomes block dispatch until explicit audited recovery;
-7. public access will use a typed HTTPS/SSE boundary rather than direct ZMQ;
-8. the current prototype is evidence, not a production API commitment.
+4. the worker is a private, subordinate process in a declared environment and reports its revision;
+5. the process split exists for dependency and failure containment, not as a physical-safety, HA, or same-user security boundary;
+6. controller state, revisions, leases, execution attempts, and controller events are durable and transactional;
+7. controller restart never reconnects to the old worker in the first release, and ambiguous execution blocks dispatch until the old authority is fenced and recovery is explicitly acknowledged;
+8. public access will use a typed HTTPS/SSE boundary rather than direct ZMQ;
+9. the current prototype is evidence, not a production API commitment.
 
 Acceptance does not approve hardware operation, production deployment, or the unresolved follow-up designs below.
 
 ## Required follow-up decisions
 
-1. Select one actual NSLS-II workflow and define its operation catalog, simulator, and acceptance scenarios.
+1. Select one actual NSLS-II workflow and define its operation catalog, simulator or test IOC, safe-stop behavior, orphan policy, and acceptance scenarios.
 2. Specify operation registration, schema generation, logical device resolution, and worker SDK packaging.
-3. Specify execution attempts, worker-session identity, worker orphan policy, supervisor responsibilities, pause/stop/cancel semantics, reconciliation, and restart behavior.
-4. Specify HTTP resources, idempotency, errors, SSE event envelopes, and retention.
-5. Select authentication integration and define authorization, lease handoff, revocation, and override policy.
+3. Specify durable execution attempts, concurrent worker control/liveness, worker-exit evidence, execution-authority fencing, pause/stop/cancel semantics, fail-closed startup, and operator recovery. Worker reattachment is out of scope for the first release.
+4. Specify the minimum HTTP resources, idempotency rules, errors, SSE event envelopes, and retention needed by the selected workflow.
+5. Select one authentication integration and define authorization, lease handoff, revocation, and override policy.
 6. Define immutable worker artifacts, deployment supervision, readiness, rollback, and provenance.
 7. Define Bluesky document routing and the run-UID/data-catalog boundary.
 8. Define SQLite backup, migration, corruption recovery, and the evidence threshold for PostgreSQL or HA.
