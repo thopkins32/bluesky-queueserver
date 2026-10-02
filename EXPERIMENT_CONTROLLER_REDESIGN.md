@@ -83,9 +83,9 @@ flowchart LR
 
 One process owns:
 
-- durable queue, operation, and execution-attempt records;
+- durable queue, queue-execution, operation, and execution-attempt records;
 - authorization and the operator-control lease;
-- operation submissions and queue scheduling;
+- operation submissions, live queue editing, and scheduling;
 - worker launch, liveness, and execution-authority fencing;
 - audit/event publishing;
 - health/readiness endpoints.
@@ -187,10 +187,20 @@ Replace client-managed lock secrets with a server-owned, persisted **control lea
 
 - an authenticated principal acquires an exclusive lease;
 - the lease has an expiry and a documented handoff/revocation procedure;
-- queue mutation and execution control require the lease;
+- external queue mutation and execution control require the lease;
 - every grant, renewal, expiry, handoff, and override is audited.
 
-This is simpler for operators than distributing a lock string and safer than an emergency lock key whose lifecycle is disconnected from identity.
+The lease authorizes commands; it is not a heartbeat for autonomous work. Expiry prevents new external mutations but does not cancel a running attempt or revoke operations already admitted to an active queue execution.
+
+### Editable queue execution
+
+A lease holder starts a durable queue execution at an observed queue revision. The record captures its UID, initiating principal, policy, starting revision, and admitted operations. The controller scheduler may continue dispatching those operations if the browser disconnects or the initiating lease expires.
+
+While execution is active, whoever currently holds the lease may add operations, cancel or reorder pending operations, or replace a pending operation with a new immutable record. New operations explicitly join the active queue execution and retain their own submitting principal. Claimed and running work cannot be edited, and cancelled or replaced operations remain in the audit history.
+
+Queue edits, scheduler claims, and queue-execution completion use the same optimistic revision and transaction boundary. Whichever commits first determines the next state: a claimed item is no longer editable, while a stale client edit fails and refreshes. The queue execution completes only when no attempt is active and no admitted operation remains queued; the first release does not wait indefinitely for later additions.
+
+This gives the operator a live, editable overnight batch without requiring a browser or human lease to remain connected. A later lease holder can take control of the same active queue, and every mutation remains individually attributed and audited.
 
 ### Lifecycle model
 
@@ -225,7 +235,9 @@ Expose narrow, separate actions:
 
 | Action | Intended behavior |
 |---|---|
-| `request_stop` | Finish the operation's defined safe boundary; do not dispatch another item. |
+| `start_queue` | Persist scheduler authorization and begin consuming the editable queue. |
+| `stop_queue` | Prevent another operation from being claimed; leave the current attempt unchanged. |
+| `request_stop` | Finish the current operation's defined safe boundary and stop queue execution. |
 | `pause` | Request a supported RunEngine pause when the selected workflow requires it. |
 | `resume` | Resume a known paused execution when the selected workflow requires it. |
 | `cancel_queued` | Remove work that has not begun. |
@@ -318,25 +330,28 @@ The MVP is complete when an authenticated client can:
 
 1. inspect health, readiness, and the worker's versioned operation catalog;
 2. acquire a control lease;
-3. submit one schema-valid operation with optimistic queue revision control;
-4. dispatch it to the isolated worker and observe durable lifecycle events through SSE;
-5. correlate the terminal operation with its Bluesky run UID;
-6. request the workflow's defined safe stop and cancel queued work;
-7. observe worker or controller loss become a durable fail-closed state;
-8. recover only after the old execution authority is fenced and an operator acknowledges the condition;
-9. restart the service without losing queue, attempt, lease, or audit history.
+3. submit several schema-valid operations with optimistic queue revision control;
+4. start a durable queue execution and observe automatic dispatch through SSE;
+5. add, cancel, replace, or reorder pending work while another operation is running;
+6. release or allow the initiating lease to expire while already admitted work continues;
+7. correlate each terminal operation with its Bluesky run UID;
+8. request the workflow's defined safe stop, stop future dispatch, and cancel queued work;
+9. observe worker or controller loss become a durable fail-closed state;
+10. recover only after the old execution authority is fenced and an operator acknowledges the condition;
+11. restart the service without losing queue-execution, queue, attempt, lease, or audit history.
 
 ### Implementation order
 
 1. **Select and freeze one workflow contract.** Name the operation, request schema, logical device identifiers, result shape, safe-stop boundary, controller-loss orphan policy, and simulator or test-IOC acceptance scenarios. Do not start with a generic plan API.
 2. **Create the clean product repository.** Carry over only the prototype's contracts, SQLite transaction model, controller behavior, worker boundary, simulator, and high-value behavioral tests. Do not import the legacy manager, Redis queue, ZMQ API, or profile-loading machinery.
-3. **Make execution fail closed.** Persist execution attempts and worker-instance evidence; add a concurrent worker control/liveness path; map every post-claim transport or protocol failure to `unknown` or `interrupted`; mark nonterminal attempts fail-closed on startup; fence the previous worker before replacement; and keep worker reattachment out of scope.
-4. **Define the narrow worker SDK.** Register the selected operation and input model, resolve reviewed logical device identifiers, expose worker/artifact revision metadata, and implement only the safe controls required by that workflow.
-5. **Expose the minimum public API.** Implement health/readiness, catalog, lease acquisition/renewal, queue snapshot, operation submission/query, dispatch, safe stop, queued cancellation, recovery acknowledgement, and cursor-based SSE. Select one authentication integration and derive principals server-side.
-6. **Package one immutable deployment.** Produce controller and worker commands from one product version, pin the worker environment, configure local SQLite storage and process supervision, and document readiness, rollback, and database backup.
-7. **Exercise the failure matrix before a pilot.** Cover worker exit, timeout, malformed response, controller loss during execution, restart with a nonterminal attempt, safe-stop delivery, fencing, duplicate-dispatch prevention, and explicit recovery against simulation or a test IOC.
+3. **Implement the durable editable scheduler.** Add the queue-execution record, operation admission, automatic FIFO claims, completion and stop policies, lease-independent dispatch of admitted work, and revisioned add/cancel/replace/reorder operations while execution is active.
+4. **Make execution fail closed.** Persist execution attempts and worker-instance evidence; add a concurrent worker control/liveness path; map every post-claim transport or protocol failure to `unknown` or `interrupted`; mark nonterminal attempts fail-closed on startup; fence the previous worker before replacement; and keep worker reattachment out of scope.
+5. **Define the narrow worker SDK.** Register the selected operation and input model, resolve reviewed logical device identifiers, expose worker/artifact revision metadata, and implement only the safe controls required by that workflow.
+6. **Expose the minimum public API.** Implement health/readiness, catalog, lease acquisition/renewal, queue snapshot and revisioned edits, queue-execution start/stop, operation query, safe stop, queued cancellation, recovery acknowledgement, and cursor-based SSE. Select one authentication integration and derive principals server-side.
+7. **Package one immutable deployment.** Produce controller and worker commands from one product version, pin the worker environment, configure local SQLite storage and process supervision, and document readiness, rollback, and database backup.
+8. **Exercise the behavioral and failure matrix before a pilot.** Cover live queue edits racing scheduler claims, lease expiry during an overnight queue, worker exit, timeout, malformed response, controller loss during execution, restart with a nonterminal attempt, safe-stop delivery, fencing, duplicate-dispatch prevention, and explicit recovery against simulation or a test IOC.
 
-Defer UI work, client SDKs, batches, multiple operation catalogs, PostgreSQL, HA, worker reattachment, dynamic environment updates, and legacy compatibility until this vertical slice works.
+Defer UI polish, client SDKs, workflow templates, multiple operation catalogs, PostgreSQL, HA, worker reattachment, dynamic environment updates, and legacy compatibility until this vertical slice works.
 
 ## Migration posture
 

@@ -29,6 +29,11 @@ append-only lifecycle events share one local SQLite transaction boundary. The
 SQLite database uses write-ahead logging and is intended for one local
 controller; this prototype makes no NFS or high-availability claim.
 
+The prototype has no durable queue-execution record or automatic scheduler.
+Each call dispatches at most one operation and requires the caller's live control
+lease. It therefore does not yet support an overnight queue that continues
+dispatching after lease expiry or lease-authorized edits to a running batch.
+
 The trusted worker runs in a separate process using the same Python interpreter
 as the controller. Requests and responses use a private newline-delimited JSON
 protocol over the subprocess standard streams. The only operation is
