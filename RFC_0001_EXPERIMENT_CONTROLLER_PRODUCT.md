@@ -13,7 +13,7 @@
 
 This RFC proposes replacing QueueServer's general remote-execution model with an explicitly incompatible, single-controller experiment-execution product. The new product will use one monorepo and one product version, a declared and versioned operation catalog instead of remote Python namespace access, a private and subordinate worker-process boundary for dependency and failure isolation, and durable transactional state with an auditable control lease.
 
-The existing QueueServer remains available to current users and receives maintenance appropriate to that product. The new controller does not inherit QueueServer's public ZMQ protocol, interactive kernel access, arbitrary script or function execution, Redis queue model, profile-loading semantics, or CLI compatibility.
+The existing QueueServer remains available to current users and receives maintenance appropriate to that product. The new controller does not inherit QueueServer's public ZMQ protocol, interactive kernel access, arbitrary script or function execution, Redis queue model, runtime-configurable profile-loading semantics, or CLI compatibility.
 
 This parent RFC fixes the product boundary and core invariants. It does not standardize the final HTTP schema, authentication provider, worker SDK, hardware operation catalog, or detailed pause/stop protocol. Those require follow-up RFCs informed by an actual instrument workflow.
 
@@ -87,6 +87,16 @@ The pair `(operation_id, operation_version)` MUST be unique within a worker cata
 The controller MUST validate the operation identity, version, JSON representation, and input schema before creating an operation record or contacting the worker. The worker MUST validate the same operation descriptor at its trust boundary before interacting with Bluesky or Ophyd.
 
 The public API MUST NOT accept Python expressions, arbitrary function names, uploaded scripts, object traversal paths, or runtime namespace references. Logical device identifiers, where needed, are resolved by reviewed worker code into permitted device objects.
+
+#### Profile-backed operation adapters
+
+Explicit registration MUST NOT require a beamline to first rewrite its complete IPython profile collection as an importable software package. A worker implementation MAY load a declared, immutable profile collection in its established startup order and then load a small beamline-owned adapter that binds selected existing plans and devices to explicit operation descriptors.
+
+This adapter is inside the private worker boundary. It MUST expose only reviewed registrations, resolve client values through explicit device maps, fail worker startup when required symbols are absent, and include the profile source revision and environment lock in the reported worker revision. A callable or device name stored in reviewed deployment code is permitted; a callable name, object path, expression, or file path supplied by a remote client is not.
+
+Existing plan implementations MAY remain in the shared profile namespace while they are incrementally improved. The registered operation owns the stable public schema, authorization identity, result contract, safe-stop behavior, and orphan policy. Implementation-only changes update the worker revision; a breaking public contract or semantic change requires a new operation version.
+
+Offline discovery MAY inspect QueueServer annotations, existing plan/device lists, permission files, and queue history to generate registration candidates or migration reports. Discovery output MUST be reviewed and committed as an explicit adapter before it can become remotely callable. The production service MUST NOT provide a generic `execute_plan(name, args, kwargs)` operation or automatically publish every discovered namespace object.
 
 ### 4. Keep the worker protocol private and the environment declared
 
@@ -308,6 +318,8 @@ QueueServer remains the supported system for existing deployments until a facili
 
 Migration tooling, if required, should export historical information offline. It must not mirror mutable queues or forward live commands between products.
 
+Adoption does not require wholesale profile-collection cleanup. A pilot worker MAY load an existing profile collection privately and register one selected workflow through an adapter. Only the code reachable from that operation needs immediate contract hardening: user-controlled `eval`, arbitrary filesystem inputs, swallowed failures, missing cleanup, and undefined stop behavior must be removed or contained. The rest of the profile remains outside the public operation catalog.
+
 ## Safety and security considerations
 
 This controller is an execution coordinator, not a physical safety system. Hardware and facility interlocks remain authoritative. Operation code MUST use supported Bluesky/Ophyd and facility control surfaces and MUST NOT bypass server-side validation or interlocks.
@@ -338,7 +350,7 @@ Acceptance does not approve hardware operation, production deployment, or the un
 ## Required follow-up decisions
 
 1. Select one actual NSLS-II workflow and define its operation catalog, simulator or test IOC, safe-stop behavior, orphan policy, and acceptance scenarios.
-2. Specify operation registration, schema generation, logical device resolution, and worker SDK packaging.
+2. Specify operation registration, schema generation, logical device resolution, native worker SDK packaging, and the profile-backed adapter used to expose selected legacy workflows without runtime namespace discovery.
 3. Specify queue-execution records, admission of live queue edits, scheduler/lease interaction, completion and stop policies, and the exact operation-to-attempt relationship.
 4. Specify durable execution attempts, concurrent worker control/liveness, worker-exit evidence, execution-authority fencing, pause/stop/cancel semantics, fail-closed startup, and operator recovery. Worker reattachment is out of scope for the first release.
 5. Specify the minimum HTTP resources, idempotency rules, errors, SSE event envelopes, and retention needed by the selected workflow.

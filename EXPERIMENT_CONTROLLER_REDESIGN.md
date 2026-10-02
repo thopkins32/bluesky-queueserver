@@ -56,7 +56,7 @@ It should **not** be:
 - a generic Jupyter service;
 - a public ZMQ broker;
 - a runtime plugin installer;
-- a profile-collection interpreter;
+- a generic, runtime-configurable profile-collection interpreter;
 - a PV-monitoring or general hardware-control service;
 - a data catalog;
 - a replacement for hardware interlocks.
@@ -179,7 +179,54 @@ Remote clients submit:
 
 The worker owns conversion from permitted logical identifiers to actual device objects. The client never traverses a worker namespace, submits Python expressions, or invokes arbitrary functions.
 
-This intentionally replaces the current dynamic `profile_ops.py` model, not ports it.
+This replaces the dynamic namespace as the public contract; it does not require rewriting every underlying Bluesky plan.
+
+### Profile-collection adoption
+
+Existing NSLS-II profile collections are operational environments rather than ordinary importable libraries. They commonly depend on lexicographically executed startup files, a shared namespace of global devices and helpers, mutable RunEngine metadata, GUI-specific services, local files, and plans composed from many other plans. Requiring a complete profile rewrite before registering one operation would block adoption and discard working beamline knowledge.
+
+Representative [SRX](https://github.com/NSLS2/srx-profile-collection), [HXN](https://github.com/NSLS2/hxn-profile-collection), and [ISS](https://github.com/NSLS2/iss-profile-collection) profiles show this pattern and also contain substantial workflow knowledge that should be reused rather than rewritten wholesale.
+
+The first worker implementations may therefore load a declared profile collection in its existing startup order and load a small beamline-owned operation adapter last. The adapter is a façade inside the private worker; it is not a public QueueServer compatibility mode. For example:
+
+```python
+@operation(
+    id="hxn.fly2d",
+    version="1",
+    input_model=Fly2DRequest,
+    orphan_policy="request-stop",
+)
+def execute_fly2d(request, context):
+    detectors = [
+        DETECTOR_MAP[detector_id]
+        for detector_id in request.detectors
+    ]
+    fast_motor = MOTOR_MAP[request.fast_axis]
+    slow_motor = MOTOR_MAP[request.slow_axis]
+
+    return context.profile["fly2dpd"](
+        detectors,
+        fast_motor,
+        request.fast_start,
+        request.fast_stop,
+        request.fast_points,
+        slow_motor,
+        request.slow_start,
+        request.slow_stop,
+        request.slow_points,
+        request.exposure,
+    )
+```
+
+Here `context.profile` is a private namespace created from the reviewed deployment, while `DETECTOR_MAP` and `MOTOR_MAP` are explicit beamline-owned mappings. The callable name and object references are selected by committed worker code; the remote request supplies only schema-valid logical identifiers and values. The public API never accepts `eval`, a callable name, an object path, or an arbitrary configuration-file path.
+
+Only the path reachable from a registered operation needs immediate hardening. For that path, the adapter or underlying plan must propagate failures, preserve cleanup, define safe-stop checkpoints and orphan behavior, and remove user-controlled namespace or filesystem access. Unrelated commissioning helpers and expert plans may remain in the profile but are not remotely callable through this product.
+
+The operation version tracks the public schema and meaning. The worker revision tracks changes to the profile commit, adapter, dependencies, and implementation. Frequent compatible beamline-code updates therefore do not require inventing a new operation version.
+
+Migration tooling should use existing QueueServer annotations, generated plan/device lists, permission files, and queue history to produce candidate adapters and catalog diffs. Generation is offline assistance only: a developer must review and commit each registration before the worker publishes it. There is no generic `execute_plan(name, args, kwargs)` escape hatch.
+
+During commissioning, a beamline may continue using interactive Bluesky or QueueServer for workflows that have not graduated to registered operations. Migration is workflow by workflow, and the old and new systems must never hold simultaneous live authority over the same instrument.
 
 ### Control lease
 
@@ -273,16 +320,17 @@ Reuse **knowledge and behavioral evidence**, not the old architecture.
 | Keep | Do not carry forward |
 |---|---|
 | Simulated beamline profiles | `RunEngineManager` as the domain boundary |
+| Existing profile-collection plans behind explicit worker adapters | Runtime namespace reflection as the public API |
+| QueueServer annotations, plan/device lists, permissions, and history as migration input | Automatic publication of every discovered callable or device |
 | Plan pause/stop/recovery scenarios | Public ZMQ command protocol |
-| RunEngine execution adapter concepts | Dynamic namespace reflection |
-| Worker isolation concept | Remote IPython kernel access |
-| Queue/history lifecycle lessons | Redis list mutation protocol |
-| Allowlist and permission lessons | Client lock-key design |
+| RunEngine execution adapter concepts | Remote IPython kernel access |
+| Worker isolation concept | Redis list mutation protocol |
+| Queue/history lifecycle lessons | Client lock-key design |
 | Existing hardware integration examples | Arbitrary script/function APIs |
 | Behavioral test cases | HTTP global-resource singleton |
 | Existing facility authentication requirements | Tiled-derived auth/database copy-paste |
 
-The current `profile_ops.py` and `manager.py` are especially valuable as reference material for edge cases, but they should not be the initial v1 implementation foundation.
+The current `profile_ops.py`, `manager.py`, profile collections, and beamline-specific queue helpers are valuable sources of domain behavior and edge cases. They should feed explicit worker adapters and behavioral tests, not become the new controller's implementation foundation or public contract.
 
 ## Repository and release strategy
 
@@ -343,10 +391,10 @@ The MVP is complete when an authenticated client can:
 ### Implementation order
 
 1. **Select and freeze one workflow contract.** Name the operation, request schema, logical device identifiers, result shape, safe-stop boundary, controller-loss orphan policy, and simulator or test-IOC acceptance scenarios. Do not start with a generic plan API.
-2. **Create the clean product repository.** Carry over only the prototype's contracts, SQLite transaction model, controller behavior, worker boundary, simulator, and high-value behavioral tests. Do not import the legacy manager, Redis queue, ZMQ API, or profile-loading machinery.
+2. **Create the clean product repository.** Carry over only the prototype's contracts, SQLite transaction model, controller behavior, worker boundary, simulator, and high-value behavioral tests. Do not import the legacy manager, Redis queue, ZMQ API, or generic profile-loading machinery into the controller. The first worker may use a narrow deployment adapter to load the selected existing profile collection privately.
 3. **Implement the durable editable scheduler.** Add the queue-execution record, operation admission, automatic FIFO claims, completion and stop policies, lease-independent dispatch of admitted work, and revisioned add/cancel/replace/reorder operations while execution is active.
 4. **Make execution fail closed.** Persist execution attempts and worker-instance evidence; add a concurrent worker control/liveness path; map every post-claim transport or protocol failure to `unknown` or `interrupted`; mark nonterminal attempts fail-closed on startup; fence the previous worker before replacement; and keep worker reattachment out of scope.
-5. **Define the narrow worker SDK.** Register the selected operation and input model, resolve reviewed logical device identifiers, expose worker/artifact revision metadata, and implement only the safe controls required by that workflow.
+5. **Define the narrow worker SDK and profile adapter.** Register the selected operation and input model, load the reviewed profile when needed, resolve logical identifiers through explicit maps, expose profile/environment revision metadata, and implement only the safe controls required by that workflow.
 6. **Expose the minimum public API.** Implement health/readiness, catalog, lease acquisition/renewal, queue snapshot and revisioned edits, queue-execution start/stop, operation query, safe stop, queued cancellation, recovery acknowledgement, and cursor-based SSE. Select one authentication integration and derive principals server-side.
 7. **Package one immutable deployment.** Produce controller and worker commands from one product version, pin the worker environment, configure local SQLite storage and process supervision, and document readiness, rollback, and database backup.
 8. **Exercise the behavioral and failure matrix before a pilot.** Cover live queue edits racing scheduler claims, lease expiry during an overnight queue, worker exit, timeout, malformed response, controller loss during execution, restart with a nonterminal attempt, safe-stop delivery, fencing, duplicate-dispatch prevention, and explicit recovery against simulation or a test IOC.
