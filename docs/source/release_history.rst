@@ -2,6 +2,17 @@
 Release History
 ===============
 
+Unreleased
+==========
+
+Added
+-----
+
+- Additive QueueServer V2 simulator service with strict operation contracts,
+  transactional SQLite state, authenticated HTTPS/SSE APIs, private worker
+  isolation, fencing, recovery, and offline administration. Existing
+  QueueServer ``0.x`` interfaces remain unchanged.
+
 
 v0.0.25 (2026-07-16)
 ====================

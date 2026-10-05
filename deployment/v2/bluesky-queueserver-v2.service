@@ -1,0 +1,21 @@
+[Unit]
+Description=Bluesky QueueServer V2 simulator controller
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bluesky-queueserver
+Group=bluesky-queueserver
+ExecStart=/opt/bluesky-queueserver-v2/bin/start-qserver-v2 --config /etc/bluesky-queueserver-v2/controller.yml
+Restart=on-failure
+KillMode=process
+SendSIGKILL=no
+TimeoutStopSec=infinity
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/bluesky-queueserver-v2
+
+[Install]
+WantedBy=multi-user.target

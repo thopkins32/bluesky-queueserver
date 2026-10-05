@@ -1,0 +1,26 @@
+instrument_id: simulator
+
+database_path: /var/lib/bluesky-queueserver-v2/controller.sqlite3
+
+worker:
+  command:
+    - /opt/bluesky-queueserver-v2/bin/qserver-v2-worker
+    - --config
+    - /etc/bluesky-queueserver-v2/worker.yml
+  startup_timeout_seconds: 10.0
+  heartbeat_interval_seconds: 1.0
+  heartbeat_timeout_seconds: 5.0
+
+oidc:
+  issuer: https://identity.example.org/
+  audience: bluesky-queueserver-v2
+  jwks_url: https://identity.example.org/.well-known/jwks.json
+  http_timeout_seconds: 5.0
+  cache_seconds: 300
+  clock_skew_seconds: 30
+
+tls:
+  certificate_path: /etc/bluesky-queueserver-v2/tls/server.crt
+  private_key_path: /etc/bluesky-queueserver-v2/tls/server.key
+
+offline_simulator: false

@@ -36,6 +36,7 @@ Bluesky-QueueServer Documentation
 
    interacting_with_qs
    re_manager_api
+   queueserver_v2
    experiment_controller_prototype
 
 .. toctree::

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft |
+| Status | Accepted |
 | Product brand | Bluesky QueueServer |
 | Architecture generation | QueueServer v2 |
 | Target distribution | `bluesky-queueserver` 2.0.0 |
@@ -156,21 +156,15 @@ QueueServer `0.x` metadata and history may generate adapter candidates offline, 
 
 ## MVP workflow contract
 
-Select one actual NSLS-II workflow before implementing the worker SDK. Record:
+The selected MVP workflow is the simulator-only `simulated-count` operation, version `1`, owned by the QueueServer maintainers. It is implemented natively in the worker and uses only Ophyd simulated hardware; it does not load a profile collection.
 
-- operation ID and version;
-- request and result models;
-- logical device identifiers;
-- underlying profile plan or native implementation;
-- worker revision inputs;
-- normal success and known failure semantics;
-- safe-stop boundary;
-- controller-loss orphan policy;
-- required Bluesky document routing;
-- simulator or test-IOC acceptance scenarios;
-- authorization policy.
+The request accepts exactly the reviewed logical detector identifier `det`, a count from 1 through 10, and an optional delay from 0 through 10 seconds. The result contains the Bluesky RunStart UIDs produced by the operation. The worker owns one RunEngine, maps `det` to the simulated detector, runs `bluesky.plans.count`, and keeps Bluesky documents out of the controller.
 
-The fastest default remains a bounded `count` operation with reviewed detector IDs, bounded `num`, optional nonnegative `delay`, returned run UIDs, safe stop at the next checkpoint, and an orphan policy that requests that stop before exit. Use it only if it represents the intended pilot; otherwise replace it with the real workflow rather than adding a second MVP operation.
+Safe stop is requested at the next RunEngine checkpoint. Controller loss applies the same fixed `request-stop` orphan policy before the worker exits. Acceptance uses deterministic Ophyd simulation only; no live hardware is approved.
+
+The public boundary authenticates OIDC JWT bearer tokens with configured issuer, audience, and JWKS settings. It derives the principal only from `sub` and authorizes the fixed `queueserver:read`, `queueserver:control`, and `queueserver:admin` scopes. QueueServer v2 and the shared distribution require Python 3.11 or newer.
+
+V2 temporarily coexists in this repository with the maintained QueueServer `0.x` generation. Existing `0.x` APIs, scripts, protocols, and behavior remain unchanged on their maintenance release line. The generations have no runtime bridge and use separate state, endpoints, and worker authority. Branch, maintenance-line, tag, publication, and release creation wait for separately authorized release work; `2.0.0` remains the eventual setuptools-scm target.
 
 ## Delivery plan
 
@@ -340,12 +334,12 @@ The MVP is done only when:
 | SQLite is used outside its supported topology | Require one controller and local persistent storage; defer HA. |
 | New and old systems both control hardware | Enforce deployment-level exclusive authority and separate state/endpoints. |
 
-## Immediate next decisions
+## Resolved implementation decisions
 
-1. Accept or amend RFC 0001.
-2. Select the single MVP workflow and its beamline owner.
-3. Confirm whether the workflow uses a native operation or profile-backed adapter.
-4. Select the authentication integration for the MVP.
-5. Establish the v2 development/release branch and QueueServer `0.x` maintenance policy.
+1. RFC 0001 is accepted.
+2. The single MVP workflow is maintainer-owned `simulated-count` version `1` against Ophyd simulation.
+3. The worker uses a native operation; no profile collection is deployed for the MVP.
+4. The public API uses OIDC JWT authentication with explicit read, control, and administrative scopes.
+5. V2 is developed additively in-tree while `0.x` remains unchanged; branch and release-line creation are deferred to release work.
 
 Implementation begins with Phase 0 and proceeds vertically. Do not start with a generic worker SDK, broad web framework, compatibility mode, or UI platform.

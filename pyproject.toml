@@ -14,7 +14,9 @@ classifiers = [
 ]
 description = "Server for queueing and executing Bluesky plans."
 dependencies = [
+    "aiosqlite>=0.20",
     "bluesky>=1.7.0",
+    "fastapi>=0.115",
     "ipykernel",
     "jsonschema",
     "jupyter-client>=7.4.2",
@@ -23,23 +25,26 @@ dependencies = [
     "openpyxl",
     "ophyd",
     "packaging",
-    "pydantic",
+    "pydantic>=2,<3",
+    "PyJWT[crypto]>=2.9",
     "python-multipart",
     "pyyaml",
     "pyzmq",
     "redis[hiredis]",
     "requests",
+    "uvicorn>=0.30",
 ]
 dynamic = ["version"]
 license = { file = "LICENSE" }
 readme = "README.rst"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 
 [project.optional-dependencies]
 dev = [
     "coverage",
     "ruff",
     "happi>=1.14.0",
+    "httpx>=0.27",
     "pre-commit",
     "pytest",
     "pytest-xprocess",
@@ -72,6 +77,9 @@ qserver-clear-lock = "bluesky_queueserver.manager.qserver_cli:qserver_clear_lock
 qserver-console = "bluesky_queueserver.manager.qserver_cli:qserver_console"
 qserver-qtconsole = "bluesky_queueserver.manager.qserver_cli:qserver_qtconsole"
 qserver-console-monitor = "bluesky_queueserver.manager.output_streaming:qserver_console_monitor_cli"
+start-qserver-v2 = "bluesky_queueserver.v2.cli:main"
+qserver-v2-worker = "bluesky_queueserver.v2.worker.runtime:main"
+qserver-v2-admin = "bluesky_queueserver.v2.admin:main"
 
 [project.urls]
 GitHub = "https://github.com/bluesky/bluesky-queueserver"
@@ -147,7 +155,7 @@ isort.required-imports = [
 
 [tool.black]
 line-length = 115
-target-version = ['py310']
+target-version = ['py311']
 include = '\.pyi?$'
 force-exclude = '''
 (

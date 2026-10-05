@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft |
+| Status | Accepted |
 | Created | 2026-09-03 |
 | Last revised | 2026-10-05 |
 | Decision scope | Next-generation product boundary and foundational architecture |
@@ -21,6 +21,16 @@ QueueServer v2 uses one versioned operation catalog, one durable transactional s
 The current QueueServer `0.x` line remains available for existing deployments and receives maintenance appropriate to that generation. QueueServer v2 is a breaking successor, not a compatibility mode, and this RFC does not approve operation on live hardware.
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** describe normative requirements.
+
+### Accepted implementation profile
+
+The first implementation is the simulator-only `simulated-count` operation, version `1`, owned by the QueueServer maintainers. It uses a native worker implementation with Ophyd simulated devices, not a profile collection. Its reviewed request is limited to the logical detector identifier `det`, bounded count and delay values, and its result is the list of Bluesky run UIDs. Safe stop occurs at the next RunEngine checkpoint. Controller loss invokes the fixed `request-stop` orphan policy before worker exit.
+
+The public service authenticates OIDC JWT bearer tokens against configured issuer, audience, and JWKS settings and authorizes the fixed read, control, and administrative scopes. QueueServer v2 and the shared distribution require Python 3.11 or newer.
+
+Implementation temporarily coexists in-tree with the maintained QueueServer `0.x` generation. Existing `0.x` APIs, scripts, protocols, and behavior remain on their maintenance release line. V2 has separate state, endpoints, worker authority, and no runtime bridge to `0.x`. Creating a development branch, maintenance branch, release tag, or published release is deferred to separately authorized release work; `2.0.0` remains the eventual setuptools-scm release target.
+
+This profile authorizes simulation only. It does not approve live hardware use or deployment.
 
 ## Product model
 
