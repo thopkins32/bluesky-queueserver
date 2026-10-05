@@ -1,22 +1,24 @@
-# RFC 0001: Bluesky Experiment Controller Product Boundary
+# RFC 0001: Bluesky QueueServer v2 Product Boundary
 
 | Field | Value |
 |---|---|
 | Status | Draft |
 | Created | 2026-09-03 |
 | Last revised | 2026-10-05 |
-| Decision scope | Product boundary and foundational architecture |
-| Target product | Working name: Bluesky Experiment Controller |
-| Project plan | [Experiment Controller Project Plan](EXPERIMENT_CONTROLLER_PROJECT_PLAN.md) |
+| Decision scope | Next-generation product boundary and foundational architecture |
+| Product brand | Bluesky QueueServer |
+| Architecture generation | QueueServer v2 |
+| Target distribution | `bluesky-queueserver` 2.0.0 |
+| Project plan | [QueueServer v2 Project Plan](QUEUESERVER_V2_PROJECT_PLAN.md) |
 | Reference prototype | [`bluesky_queueserver._experiment_controller`](src/bluesky_queueserver/_experiment_controller/) |
 
 ## Decision
 
-Replace QueueServer's general remote-execution model with an intentionally incompatible, single-controller experiment-execution product.
+Replace the current QueueServer general remote-execution architecture with an intentionally incompatible next major generation: Bluesky QueueServer v2.
 
-The product uses one versioned operation catalog, one durable transactional state store, one authenticated control lease, one active controller per instrument, and one private subordinate worker process. It exposes a typed HTTPS/SSE API and fails closed whenever a claimed execution outcome cannot be proven.
+QueueServer v2 uses one versioned operation catalog, one durable transactional state store, one authenticated control lease, one active controller per instrument, and one private subordinate worker process. It exposes a typed HTTPS/SSE API and fails closed whenever a claimed execution outcome cannot be proven.
 
-QueueServer remains the supported system for existing deployments. This RFC does not create a QueueServer v2 compatibility mode or approve operation on live hardware.
+The current QueueServer `0.x` line remains available for existing deployments and receives maintenance appropriate to that generation. QueueServer v2 is a breaking successor, not a compatibility mode, and this RFC does not approve operation on live hardware.
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** describe normative requirements.
 
@@ -26,9 +28,11 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** de
 
 The initial product MUST use one repository and one product version for protocol models, controller, worker SDK, web API, storage, tests, and deployment examples.
 
+The released v2 product SHOULD retain the canonical `bluesky-queueserver` project identity, Python distribution, and `bluesky_queueserver` import namespace. The target release is `2.0.0`, making the architectural break explicit. Development MAY use a dedicated branch or temporary incubation repository, but v2 MUST NOT become a permanently separate sibling product. The current `0.x` generation requires a documented maintenance branch and support policy.
+
 Each instrument deployment MUST have exactly one active controller. The controller is the sole owner of authentication decisions, the control lease, queue state, scheduling, execution attempts, recovery state, and controller events. The first release has no active-active controller, horizontal web workers sharing mutable state, or distributed scheduling.
 
-QueueServer and the new controller MUST NOT share a queue, worker, endpoint, state store, or simultaneous authority over the same live instrument.
+Current QueueServer and QueueServer v2 MUST NOT share a queue, worker, endpoint, state store, or simultaneous authority over the same live instrument.
 
 ### Explicit versioned operations
 
@@ -158,13 +162,13 @@ Controller events and Bluesky documents are separate data planes. Controller eve
 15. Failed, interrupted, and unknown work is never automatically retried.
 16. Recovery is explicit, authenticated, and audited.
 17. The controller and worker never bypass device, IOC, PLC, or facility interlocks.
-18. QueueServer and the new product never share live control authority.
+18. Current QueueServer and QueueServer v2 never share live control authority.
 
 ## Rationale and rejected alternatives
 
 | Choice | Decision |
 |---|---|
-| Evolve QueueServer in place | Rejected: compatibility retains the dynamic execution, transport, storage, and package boundaries being removed. |
+| Preserve QueueServer `0.x` compatibility in v2 | Rejected: compatibility retains the dynamic execution, transport, storage, and package boundaries being removed. |
 | Public generic plan/function API | Rejected: an allowlisted Python namespace remains an unstable and overly broad product contract. |
 | Require profile cleanup before adoption | Rejected: selected workflows may be exposed through private profile-backed adapters. |
 | Redis as the domain store | Rejected initially: SQLite provides the required transaction, revision, and event boundary for one controller. |
@@ -177,7 +181,7 @@ Controller events and Bluesky documents are separate data planes. Controller eve
 
 The first product does not provide:
 
-- QueueServer protocol, queue, history, CLI, or SDK compatibility;
+- QueueServer `0.x` protocol, queue, history, CLI, or SDK compatibility;
 - dynamic public plan/device discovery;
 - arbitrary functions, scripts, or Python expressions;
 - an interactive IPython worker;
@@ -190,9 +194,9 @@ The first product does not provide:
 
 ## Migration and safety posture
 
-Adoption is workflow-by-workflow. A pilot worker MAY privately load an existing profile collection and register one selected workflow. Only the reachable path requires immediate contract hardening; unrelated expert and commissioning helpers remain outside the catalog.
+Adoption is workflow-by-workflow. A v2 pilot worker MAY privately load an existing profile collection and register one selected workflow. Only the reachable path requires immediate contract hardening; unrelated expert and commissioning helpers remain outside the catalog.
 
-Interactive Bluesky or QueueServer may remain in use for workflows not yet migrated, but cutover must provide separate state, endpoints, workers, and control authority. No runtime bridge mirrors queues or forwards live commands.
+Interactive Bluesky or current QueueServer may remain in use for workflows not yet migrated, but cutover must provide separate state, endpoints, workers, and control authority. No runtime bridge mirrors queues or forwards live commands between generations.
 
 A worker running under the same operating-system principal as the controller is not a security sandbox. Stronger containment requires deployment-level credentials, filesystem and network permissions, or operating-system isolation.
 
@@ -200,10 +204,10 @@ No hardware pilot may begin until identity, authorization, the selected operatio
 
 ## Prototype status
 
-The internal prototype proves a typed controller/worker contract, strict catalog validation, SQLite WAL storage, queue revisions, a persisted lease, one simulated operation, separate-process RunEngine execution, run-UID correlation, durable events, and conservative transport-loss handling.
+The internal `_experiment_controller` prototype proves a typed controller/worker contract, strict catalog validation, SQLite WAL storage, queue revisions, a persisted lease, one simulated operation, separate-process RunEngine execution, run-UID correlation, durable events, and conservative transport-loss handling.
 
-It does not implement the target queue-execution scheduler, execution attempts, profile adapter, independent worker environment, concurrent control/liveness, safe stop, orphan exit, fencing, authenticated HTTP/SSE, or production deployment. The [project plan](EXPERIMENT_CONTROLLER_PROJECT_PLAN.md) defines the implementation sequence.
+It does not implement the target queue-execution scheduler, execution attempts, profile adapter, independent worker environment, concurrent control/liveness, safe stop, orphan exit, fencing, authenticated HTTP/SSE, or production deployment. The [QueueServer v2 project plan](QUEUESERVER_V2_PROJECT_PLAN.md) defines the implementation sequence.
 
 ## Acceptance
 
-Accepting this RFC approves the product boundary and invariants above. It does not approve live hardware operation, production deployment, or the prototype's exact Python and stdio interfaces.
+Accepting this RFC approves the QueueServer v2 product boundary and invariants above. It does not approve live hardware operation, production deployment, compatibility with QueueServer `0.x`, or the prototype's exact Python and stdio interfaces.

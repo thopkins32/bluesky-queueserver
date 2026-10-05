@@ -1,17 +1,20 @@
-# Bluesky Experiment Controller Project Plan
+# Bluesky QueueServer v2 Project Plan
 
 | Field | Value |
 |---|---|
 | Status | Draft |
-| Normative architecture | [RFC 0001](RFC_0001_EXPERIMENT_CONTROLLER_PRODUCT.md) |
+| Product brand | Bluesky QueueServer |
+| Architecture generation | QueueServer v2 |
+| Target distribution | `bluesky-queueserver` 2.0.0 |
+| Normative architecture | [RFC 0001](RFC_0001_QUEUESERVER_V2_PRODUCT.md) |
 | Reference prototype | [`bluesky_queueserver._experiment_controller`](src/bluesky_queueserver/_experiment_controller/) |
-| Prototype guide | [Internal Experiment Controller Prototype](docs/source/experiment_controller_prototype.rst) |
+| Prototype guide | [Internal QueueServer v2 Prototype](docs/source/experiment_controller_prototype.rst) |
 
 ## Goal
 
-Deliver an authenticated, auditable execution service for one scientific instrument. Clients submit only reviewed, versioned operations. One controller owns durable state and dispatches work to one private Bluesky/Ophyd worker process.
+Deliver Bluesky QueueServer v2 as an authenticated, auditable execution service for one scientific instrument. Clients submit only reviewed, versioned operations. One controller owns durable state and dispatches work to one private Bluesky/Ophyd worker process.
 
-The product is a clean replacement for selected QueueServer workflows, not a compatible QueueServer v2, full beamline control system, remote Python shell, or general workflow engine.
+QueueServer v2 is an intentionally incompatible next major generation. It retains the established QueueServer product identity while replacing the `0.x` protocol, dynamic execution surface, storage model, and recovery semantics. It is not a full beamline control system, remote Python shell, or general workflow engine.
 
 ## MVP outcome
 
@@ -149,7 +152,7 @@ Only the path reachable from the registered operation needs immediate hardening:
 - define safe-stop checkpoints and controller-loss behavior;
 - return deterministic results and run UIDs.
 
-QueueServer metadata and history may generate adapter candidates offline, but a developer must review and commit each registration. Interactive Bluesky or QueueServer may remain available for unmigrated workflows, provided it never shares simultaneous live authority with the new controller.
+QueueServer `0.x` metadata and history may generate adapter candidates offline, but a developer must review and commit each registration. Interactive Bluesky or current QueueServer may remain available for unmigrated workflows, provided it never shares simultaneous live authority with QueueServer v2.
 
 ## MVP workflow contract
 
@@ -184,17 +187,19 @@ Deliverables:
 
 Exit criteria: the operation schema, result, safe stop, orphan policy, permissions, and acceptance scenarios are reviewable without referring to an arbitrary Python namespace.
 
-### Phase 1: Create the product repository
+### Phase 1: Establish the v2 codebase and release line
 
 Deliverables:
 
-- new monorepo and product name;
-- protocol, controller, storage, worker, worker SDK, web, deployment, and test packages;
+- canonical `bluesky-queueserver` project, distribution, and `bluesky_queueserver` namespace retained for the released product;
+- target package version `2.0.0`;
+- documented development branch or temporary incubation strategy and `0.x` maintenance policy;
+- clean protocol, controller, storage, worker, worker SDK, web, deployment, and test packages with no legacy manager imports;
 - one locked development environment and task runner;
-- prototype contracts, SQLite behavior, simulator, and high-value behavioral tests migrated without legacy manager imports;
+- prototype contracts, SQLite behavior, simulator, and high-value behavioral tests migrated;
 - generated version/provenance metadata.
 
-Exit criteria: the existing simulated operation runs end to end in the new repository with the same durable record and event behavior.
+Exit criteria: the existing simulated operation runs end to end in the v2 codebase with the same durable record and event behavior, while the current `0.x` line remains independently maintainable.
 
 ### Phase 2: Implement the durable editable scheduler
 
@@ -317,7 +322,7 @@ The MVP is done only when:
 - automatic retry policies;
 - worker reattachment or transparent continuation;
 - dynamic environment updates;
-- QueueServer compatibility or runtime bridges;
+- QueueServer `0.x` protocol/API compatibility or runtime bridges;
 - PostgreSQL, HA, active-active controllers, or SQLite over NFS;
 - a Bluesky document store or data catalog;
 - direct PV monitoring or arbitrary hardware control.
@@ -328,7 +333,7 @@ The MVP is done only when:
 |---|---|
 | Beamlines cannot rewrite profile collections | Load profiles privately and register one adapter-backed workflow at a time. |
 | Registered operations become boilerplate-heavy | Generate candidate models and adapters offline; require review before publication. |
-| A generic escape hatch recreates QueueServer | Prohibit public callable names, object paths, scripts, and automatic discovery. |
+| A generic escape hatch recreates QueueServer `0.x` | Prohibit public callable names, object paths, scripts, and automatic discovery. |
 | Worker failures create ambiguous physical state | Persist attempts before dispatch, fail unknown, block, fence, and require recovery. |
 | Lease mechanics leak into operator UX | Present Take control, Release control, Stop after current, and Recovery required; hide lease IDs and revisions. |
 | Scope expands into a beamline framework | Keep one operation, one controller, one worker, and one public contract through MVP. |
@@ -341,6 +346,6 @@ The MVP is done only when:
 2. Select the single MVP workflow and its beamline owner.
 3. Confirm whether the workflow uses a native operation or profile-backed adapter.
 4. Select the authentication integration for the MVP.
-5. Choose the product/repository name and create the clean monorepo.
+5. Establish the v2 development/release branch and QueueServer `0.x` maintenance policy.
 
 Implementation begins with Phase 0 and proceeds vertically. Do not start with a generic worker SDK, broad web framework, compatibility mode, or UI platform.

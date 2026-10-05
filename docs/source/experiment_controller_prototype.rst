@@ -1,11 +1,11 @@
-========================================
-Internal Experiment Controller Prototype
-========================================
+==========================================
+Internal QueueServer v2 Contract Prototype
+==========================================
 
 .. warning::
 
-   This is an internal, simulator-only prototype. It is not a production control
-   service and does not support hardware.
+   This is an internal, simulator-only QueueServer v2 contract prototype. It is
+   not a production control service and does not support hardware.
 
 The prototype demonstrates one complete control path: acquire a control lease,
 submit a versioned operation, durably claim it from a FIFO queue, execute it in a
@@ -58,9 +58,9 @@ Deliberate exclusions
 =====================
 
 This slice provides no HTTP service, authentication or authorization
-integration, public ZMQ endpoint, legacy QueueServer compatibility gateway,
+integration, public ZMQ endpoint, QueueServer ``0.x`` compatibility gateway,
 profile loading, arbitrary script or function execution, IPython console,
 remote environment control, or hardware support. The caller supplies a trusted
 subject string to exercise lease semantics. Importing the private child package
-also still imports the existing distribution's parent package; independent
-service deployment remains outside this prototype.
+still imports the current distribution's parent package; the prototype does not
+yet represent the final QueueServer v2 package or runtime boundary.
