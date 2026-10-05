@@ -11,7 +11,6 @@ import sys
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -644,34 +643,6 @@ MIGRATIONS = (Migration(version=1, statements=_MIGRATION_1_STATEMENTS),)
 SCHEMA_VERSION = MIGRATIONS[-1].version
 
 
-class ReentrantAsyncLock:
-    def __init__(self) -> None:
-        self._lock = asyncio.Lock()
-        self._owner: asyncio.Task[object] | None = None
-        self._depth = 0
-
-    async def __aenter__(self) -> ReentrantAsyncLock:
-        task = asyncio.current_task()
-        if task is None:
-            raise RuntimeError("database lock requires an asyncio task")
-        if self._owner is task:
-            self._depth += 1
-            return self
-        await self._lock.acquire()
-        self._owner = task
-        self._depth = 1
-        return self
-
-    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
-        task = asyncio.current_task()
-        if task is not self._owner:
-            raise RuntimeError("database lock released by a different task")
-        self._depth -= 1
-        if self._depth == 0:
-            self._owner = None
-            self._lock.release()
-
-
 class SQLiteStore:
     """One asynchronous connection to a local QueueServer V2 authority database."""
 
@@ -694,12 +665,8 @@ class SQLiteStore:
         self._allow_migrate = allow_migrate
         self._clock = clock or (lambda: time.time_ns() // 1_000)
         self._connection: aiosqlite.Connection | None = None
-        self._transaction_lock = ReentrantAsyncLock()
+        self._transaction_lock = asyncio.Lock()
         self._event_condition = asyncio.Condition()
-        self._transaction_connection: ContextVar[aiosqlite.Connection | None] = ContextVar(
-            f"queueserver_v2_transaction_{id(self)}",
-            default=None,
-        )
         self._transaction_has_event = False
 
     @property
@@ -763,23 +730,27 @@ class SQLiteStore:
 
     async def pragma_settings(self) -> dict[str, int | str]:
         async with self._transaction_lock:
-            connection = self._require_connection()
-            return {
-                "application_id": int((await self._fetchone_on(connection, "PRAGMA application_id"))[0]),
-                "busy_timeout": int((await self._fetchone_on(connection, "PRAGMA busy_timeout"))[0]),
-                "foreign_keys": int((await self._fetchone_on(connection, "PRAGMA foreign_keys"))[0]),
-                "journal_mode": str((await self._fetchone_on(connection, "PRAGMA journal_mode"))[0]).lower(),
-                "synchronous": int((await self._fetchone_on(connection, "PRAGMA synchronous"))[0]),
-            }
+            return await self._pragma_settings_on(self._require_connection())
+
+    async def _pragma_settings_on(self, connection: aiosqlite.Connection) -> dict[str, int | str]:
+        return {
+            "application_id": int((await self._fetchone_on(connection, "PRAGMA application_id"))[0]),
+            "busy_timeout": int((await self._fetchone_on(connection, "PRAGMA busy_timeout"))[0]),
+            "foreign_keys": int((await self._fetchone_on(connection, "PRAGMA foreign_keys"))[0]),
+            "journal_mode": str((await self._fetchone_on(connection, "PRAGMA journal_mode"))[0]).lower(),
+            "synchronous": int((await self._fetchone_on(connection, "PRAGMA synchronous"))[0]),
+        }
 
     async def schema_info(self) -> tuple[int, str]:
         async with self._transaction_lock:
-            connection = self._require_connection()
-            row = await self._fetchone_on(
-                connection,
-                "SELECT version, checksum FROM schema_migrations ORDER BY version DESC LIMIT 1",
-            )
-            return int(row["version"]), str(row["checksum"])
+            return await self._schema_info_on(self._require_connection())
+
+    async def _schema_info_on(self, connection: aiosqlite.Connection) -> tuple[int, str]:
+        row = await self._fetchone_on(
+            connection,
+            "SELECT version, checksum FROM schema_migrations ORDER BY version DESC LIMIT 1",
+        )
+        return int(row["version"]), str(row["checksum"])
 
     async def _prepare_schema(self, connection: aiosqlite.Connection, *, empty_database: bool) -> None:
         migration_table = await self._fetchall_on(
@@ -891,154 +862,184 @@ class SQLiteStore:
         fence_evidence: Mapping[str, object],
         now: int | None = None,
     ) -> tuple[DispatchBlockRecord, int]:
-        evidence_json = canonical_json(dict(fence_evidence))
         timestamp = self._timestamp(now)
         dispatch_block_uid = str(uuid4())
-        async with self.transaction() as connection:
-            new_revision = await self._increment_revision_on(connection)
-            attempts = await self._fetchall_on(
+        async with self._transaction() as connection:
+            return await self._mark_restore_requires_review_on(
                 connection,
-                "SELECT * FROM execution_attempts WHERE state IN ('claimed', 'running')",
+                fence_evidence=fence_evidence,
+                timestamp=timestamp,
+                dispatch_block_uid=dispatch_block_uid,
             )
-            for attempt in attempts:
-                await connection.execute(
-                    """
-                    UPDATE execution_attempts
-                    SET state='unknown', completed_at=?, diagnostic=?, cleanup_completed=0
-                    WHERE attempt_uid=?
-                    """,
-                    (timestamp, "database restored with a nonterminal attempt", attempt["attempt_uid"]),
-                )
-                await connection.execute(
-                    "UPDATE operations SET state='unknown', updated_at=? WHERE operation_uid=?",
-                    (timestamp, attempt["operation_uid"]),
-                )
-                await self._insert_event_on(
-                    connection,
-                    timestamp=timestamp,
-                    actor_kind=ActorKind.SYSTEM,
-                    actor_id="restore",
-                    event_type="operation.unknown",
-                    queue_revision=new_revision,
-                    operation_uid=str(attempt["operation_uid"]),
-                    queue_execution_uid=str(attempt["queue_execution_uid"]),
-                    attempt_uid=str(attempt["attempt_uid"]),
-                    worker_instance_uid=str(attempt["worker_instance_uid"]),
-                    payload={"reason": "database restored", "cleanup_completed": False},
-                )
+
+    async def _mark_restore_requires_review_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        fence_evidence: Mapping[str, object],
+        timestamp: int,
+        dispatch_block_uid: str,
+    ) -> tuple[DispatchBlockRecord, int]:
+        evidence_json = canonical_json(dict(fence_evidence))
+        new_revision = await self._increment_revision_on(connection)
+        attempts = await self._fetchall_on(
+            connection,
+            "SELECT * FROM execution_attempts WHERE state IN ('claimed', 'running')",
+        )
+        for attempt in attempts:
             await connection.execute(
                 """
-                UPDATE queue_executions
-                SET state='stopped', updated_at=?, completed_at=?
-                WHERE state IN ('running', 'stopping', 'blocked')
+                UPDATE execution_attempts
+                SET state='unknown', completed_at=?, diagnostic=?, cleanup_completed=0
+                WHERE attempt_uid=?
                 """,
-                (timestamp, timestamp),
+                (timestamp, "database restored with a nonterminal attempt", attempt["attempt_uid"]),
             )
             await connection.execute(
-                """
-                UPDATE dispatch_blocks
-                SET acknowledged_at=?, acknowledged_by='system',
-                    acknowledgement_note='superseded by restore review'
-                WHERE acknowledged_at IS NULL
-                """,
-                (timestamp,),
-            )
-            await connection.execute(
-                """
-                UPDATE worker_instances SET state='fenced', exited_at=?
-                WHERE state IN ('starting', 'ready', 'stopping')
-                """,
-                (timestamp,),
-            )
-            await connection.execute(
-                """
-                INSERT INTO dispatch_blocks(
-                    dispatch_block_uid, kind, reason, requires_fence,
-                    fence_evidence_json, created_at, fenced_at
-                ) VALUES (?, 'restore.requires_review', 'restored state requires operator review', 1, ?, ?, ?)
-                """,
-                (dispatch_block_uid, evidence_json, timestamp, timestamp),
-            )
-            await connection.execute(
-                "UPDATE controller_metadata SET active_dispatch_block_uid=? WHERE singleton=1",
-                (dispatch_block_uid,),
+                "UPDATE operations SET state='unknown', updated_at=? WHERE operation_uid=?",
+                (timestamp, attempt["operation_uid"]),
             )
             await self._insert_event_on(
                 connection,
                 timestamp=timestamp,
                 actor_kind=ActorKind.SYSTEM,
                 actor_id="restore",
-                event_type="restore.requires_review",
+                event_type="operation.unknown",
                 queue_revision=new_revision,
-                payload={"dispatch_block_uid": dispatch_block_uid, "fence_evidence": dict(fence_evidence)},
+                operation_uid=str(attempt["operation_uid"]),
+                queue_execution_uid=str(attempt["queue_execution_uid"]),
+                attempt_uid=str(attempt["attempt_uid"]),
+                worker_instance_uid=str(attempt["worker_instance_uid"]),
+                payload={"reason": "database restored", "cleanup_completed": False},
             )
-            block = await self._dispatch_block_row_on(connection, dispatch_block_uid)
-        return self._row_to_dispatch_block(block), new_revision
+        await connection.execute(
+            """
+            UPDATE queue_executions
+            SET state='stopped', updated_at=?, completed_at=?
+            WHERE state IN ('running', 'stopping', 'blocked')
+            """,
+            (timestamp, timestamp),
+        )
+        await connection.execute(
+            """
+            UPDATE dispatch_blocks
+            SET acknowledged_at=?, acknowledged_by='system',
+                acknowledgement_note='superseded by restore review'
+            WHERE acknowledged_at IS NULL
+            """,
+            (timestamp,),
+        )
+        await connection.execute(
+            """
+            UPDATE worker_instances SET state='fenced', exited_at=?
+            WHERE state IN ('starting', 'ready', 'stopping')
+            """,
+            (timestamp,),
+        )
+        await connection.execute(
+            """
+            INSERT INTO dispatch_blocks(
+                dispatch_block_uid, kind, reason, requires_fence,
+                fence_evidence_json, created_at, fenced_at
+            ) VALUES (?, 'restore.requires_review', 'restored state requires operator review', 1, ?, ?, ?)
+            """,
+            (dispatch_block_uid, evidence_json, timestamp, timestamp),
+        )
+        await connection.execute(
+            "UPDATE controller_metadata SET active_dispatch_block_uid=? WHERE singleton=1",
+            (dispatch_block_uid,),
+        )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.SYSTEM,
+            actor_id="restore",
+            event_type="restore.requires_review",
+            queue_revision=new_revision,
+            payload={"dispatch_block_uid": dispatch_block_uid, "fence_evidence": dict(fence_evidence)},
+        )
+        return self._row_to_dispatch_block(
+            await self._dispatch_block_row_on(connection, dispatch_block_uid)
+        ), new_revision
 
     async def get_active_dispatch_block(self) -> DispatchBlockRecord | None:
         async with self._transaction_lock:
-            rows = await self._fetchall_on(
-                self._require_connection(),
-                "SELECT * FROM dispatch_blocks WHERE acknowledged_at IS NULL",
-            )
-            return None if not rows else self._row_to_dispatch_block(rows[0])
+            return await self._active_dispatch_block_on(self._require_connection())
+
+    async def _active_dispatch_block_on(
+        self,
+        connection: aiosqlite.Connection,
+    ) -> DispatchBlockRecord | None:
+        rows = await self._fetchall_on(
+            connection,
+            "SELECT * FROM dispatch_blocks WHERE acknowledged_at IS NULL",
+        )
+        return None if not rows else self._row_to_dispatch_block(rows[0])
 
     async def recover_startup(self, *, now: int | None = None) -> DispatchBlockRecord | None:
         timestamp = self._timestamp(now)
-        async with self.transaction() as connection:
+        async with self._transaction() as connection:
+            return await self._recover_startup_on(connection, timestamp=timestamp)
+
+    async def _recover_startup_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        timestamp: int,
+    ) -> DispatchBlockRecord | None:
+        blocks = await self._fetchall_on(
+            connection,
+            "SELECT * FROM dispatch_blocks WHERE acknowledged_at IS NULL",
+        )
+        attempts = await self._fetchall_on(
+            connection,
+            "SELECT * FROM execution_attempts WHERE state IN ('claimed', 'running')",
+        )
+        if blocks and attempts:
+            raise StorageError("active dispatch block and nonterminal attempt coexist")
+        if attempts:
+            attempt = attempts[0]
+            new_revision = await self._increment_revision_on(connection)
+            diagnostic = "controller restarted with a nonterminal attempt"
+            await connection.execute(
+                """
+                UPDATE execution_attempts
+                SET state='unknown', completed_at=?, diagnostic=?, cleanup_completed=0
+                WHERE attempt_uid=?
+                """,
+                (timestamp, diagnostic, attempt["attempt_uid"]),
+            )
+            await connection.execute(
+                "UPDATE operations SET state='unknown', updated_at=? WHERE operation_uid=?",
+                (timestamp, attempt["operation_uid"]),
+            )
+            await self._insert_event_on(
+                connection,
+                timestamp=timestamp,
+                actor_kind=ActorKind.SYSTEM,
+                actor_id="startup-recovery",
+                event_type="operation.unknown",
+                queue_revision=new_revision,
+                operation_uid=str(attempt["operation_uid"]),
+                queue_execution_uid=str(attempt["queue_execution_uid"]),
+                attempt_uid=str(attempt["attempt_uid"]),
+                worker_instance_uid=str(attempt["worker_instance_uid"]),
+                payload={"reason": diagnostic, "cleanup_completed": False, "run_uids": []},
+            )
+            await self._block_dispatch_on(
+                connection,
+                attempt_row=attempt,
+                kind="unknown",
+                reason=diagnostic,
+                requires_fence=True,
+                timestamp=timestamp,
+                queue_revision=new_revision,
+            )
             blocks = await self._fetchall_on(
                 connection,
                 "SELECT * FROM dispatch_blocks WHERE acknowledged_at IS NULL",
             )
-            attempts = await self._fetchall_on(
-                connection,
-                "SELECT * FROM execution_attempts WHERE state IN ('claimed', 'running')",
-            )
-            if blocks and attempts:
-                raise StorageError("active dispatch block and nonterminal attempt coexist")
-            if attempts:
-                attempt = attempts[0]
-                new_revision = await self._increment_revision_on(connection)
-                diagnostic = "controller restarted with a nonterminal attempt"
-                await connection.execute(
-                    """
-                    UPDATE execution_attempts
-                    SET state='unknown', completed_at=?, diagnostic=?, cleanup_completed=0
-                    WHERE attempt_uid=?
-                    """,
-                    (timestamp, diagnostic, attempt["attempt_uid"]),
-                )
-                await connection.execute(
-                    "UPDATE operations SET state='unknown', updated_at=? WHERE operation_uid=?",
-                    (timestamp, attempt["operation_uid"]),
-                )
-                await self._insert_event_on(
-                    connection,
-                    timestamp=timestamp,
-                    actor_kind=ActorKind.SYSTEM,
-                    actor_id="startup-recovery",
-                    event_type="operation.unknown",
-                    queue_revision=new_revision,
-                    operation_uid=str(attempt["operation_uid"]),
-                    queue_execution_uid=str(attempt["queue_execution_uid"]),
-                    attempt_uid=str(attempt["attempt_uid"]),
-                    worker_instance_uid=str(attempt["worker_instance_uid"]),
-                    payload={"reason": diagnostic, "cleanup_completed": False, "run_uids": []},
-                )
-                await self._block_dispatch_on(
-                    connection,
-                    attempt_row=attempt,
-                    kind="unknown",
-                    reason=diagnostic,
-                    requires_fence=True,
-                    timestamp=timestamp,
-                    queue_revision=new_revision,
-                )
-                blocks = await self._fetchall_on(
-                    connection,
-                    "SELECT * FROM dispatch_blocks WHERE acknowledged_at IS NULL",
-                )
-            return None if not blocks else self._row_to_dispatch_block(blocks[0])
+        return None if not blocks else self._row_to_dispatch_block(blocks[0])
 
     async def record_worker_fenced(
         self,
@@ -1046,12 +1047,119 @@ class SQLiteStore:
         evidence: Mapping[str, object],
         now: int | None = None,
     ) -> DispatchBlockRecord | None:
-        evidence_json = canonical_json(dict(evidence))
         timestamp = self._timestamp(now)
-        async with self.transaction() as connection:
-            blocks = await self._fetchall_on(
+        async with self._transaction() as connection:
+            return await self._record_worker_fenced_on(
                 connection,
-                "SELECT * FROM dispatch_blocks WHERE acknowledged_at IS NULL",
+                evidence=evidence,
+                timestamp=timestamp,
+            )
+
+    async def _record_worker_fenced_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        evidence: Mapping[str, object],
+        timestamp: int,
+    ) -> DispatchBlockRecord | None:
+        evidence_json = canonical_json(dict(evidence))
+        blocks = await self._fetchall_on(
+            connection,
+            "SELECT * FROM dispatch_blocks WHERE acknowledged_at IS NULL",
+        )
+        active_workers = await self._fetchall_on(
+            connection,
+            """
+            SELECT worker_instance_uid FROM worker_instances
+            WHERE state IN ('starting', 'ready', 'stopping')
+            """,
+        )
+        block = None if not blocks else blocks[0]
+        if block is not None and block["fenced_at"] is not None:
+            return self._row_to_dispatch_block(block)
+        if block is None and not active_workers:
+            return None
+        new_revision = await self._increment_revision_on(connection)
+        if block is not None:
+            await connection.execute(
+                "UPDATE dispatch_blocks SET fence_evidence_json=?, fenced_at=? WHERE dispatch_block_uid=?",
+                (evidence_json, timestamp, block["dispatch_block_uid"]),
+            )
+        for worker in active_workers:
+            await connection.execute(
+                "UPDATE worker_instances SET state='fenced', exited_at=? WHERE worker_instance_uid=?",
+                (timestamp, worker["worker_instance_uid"]),
+            )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.SYSTEM,
+            actor_id="controller",
+            event_type="worker.fenced",
+            queue_revision=new_revision,
+            worker_instance_uid=None if not active_workers else str(active_workers[0]["worker_instance_uid"]),
+            payload=dict(evidence),
+        )
+        if block is None:
+            return None
+        return self._row_to_dispatch_block(
+            await self._dispatch_block_row_on(connection, str(block["dispatch_block_uid"]))
+        )
+
+    async def acknowledge_recovery(
+        self,
+        *,
+        principal: str,
+        expected_revision: int,
+        note: str,
+        fence_evidence: Mapping[str, object] | None = None,
+        now: int | None = None,
+    ) -> int:
+        if not note.strip() or len(note) > 1000:
+            raise ValueError("recovery note must be nonblank and at most 1000 characters")
+        timestamp = self._timestamp(now)
+        await self.expire_control_lease(now=timestamp)
+        async with self._transaction() as connection:
+            return await self._acknowledge_recovery_on(
+                connection,
+                principal=principal,
+                expected_revision=expected_revision,
+                note=note,
+                fence_evidence=fence_evidence,
+                timestamp=timestamp,
+            )
+
+    async def _acknowledge_recovery_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        principal: str,
+        expected_revision: int,
+        note: str,
+        fence_evidence: Mapping[str, object] | None,
+        timestamp: int,
+    ) -> int:
+        self._validate_principal(principal)
+        if not note.strip() or len(note) > 1000:
+            raise ValueError("recovery note must be nonblank and at most 1000 characters")
+        await self._validate_active_lease_on(connection, principal=principal, timestamp=timestamp)
+        await self._validate_revision_on(connection, expected_revision)
+        blocks = await self._fetchall_on(
+            connection,
+            "SELECT * FROM dispatch_blocks WHERE acknowledged_at IS NULL",
+        )
+        if not blocks:
+            raise StateConflictError("no recovery acknowledgement is required")
+        block = blocks[0]
+        needs_fence = bool(block["requires_fence"]) and block["fenced_at"] is None
+        if needs_fence and fence_evidence is None:
+            raise StateConflictError("prior worker authority has not been fenced")
+        new_revision = await self._increment_revision_on(connection)
+        if fence_evidence is not None and block["fenced_at"] is None:
+            evidence_json = canonical_json(dict(fence_evidence))
+            await connection.execute(
+                "UPDATE dispatch_blocks SET fence_evidence_json=?, fenced_at=? WHERE dispatch_block_uid=?",
+                (evidence_json, timestamp, block["dispatch_block_uid"]),
             )
             active_workers = await self._fetchall_on(
                 connection,
@@ -1060,17 +1168,6 @@ class SQLiteStore:
                 WHERE state IN ('starting', 'ready', 'stopping')
                 """,
             )
-            block = None if not blocks else blocks[0]
-            if block is not None and block["fenced_at"] is not None:
-                return self._row_to_dispatch_block(block)
-            if block is None and not active_workers:
-                return None
-            new_revision = await self._increment_revision_on(connection)
-            if block is not None:
-                await connection.execute(
-                    "UPDATE dispatch_blocks SET fence_evidence_json=?, fenced_at=? WHERE dispatch_block_uid=?",
-                    (evidence_json, timestamp, block["dispatch_block_uid"]),
-                )
             for worker in active_workers:
                 await connection.execute(
                     "UPDATE worker_instances SET state='fenced', exited_at=? WHERE worker_instance_uid=?",
@@ -1086,103 +1183,38 @@ class SQLiteStore:
                 worker_instance_uid=(
                     None if not active_workers else str(active_workers[0]["worker_instance_uid"])
                 ),
-                payload=dict(evidence),
+                payload=dict(fence_evidence),
             )
-            if block is None:
-                return None
-            updated = await self._dispatch_block_row_on(connection, str(block["dispatch_block_uid"]))
-        return self._row_to_dispatch_block(updated)
-
-    async def acknowledge_recovery(
-        self,
-        *,
-        principal: str,
-        expected_revision: int,
-        note: str,
-        fence_evidence: Mapping[str, object] | None = None,
-        now: int | None = None,
-    ) -> int:
-        if not note.strip() or len(note) > 1000:
-            raise ValueError("recovery note must be nonblank and at most 1000 characters")
-        timestamp = self._timestamp(now)
-        await self.expire_control_lease(now=timestamp)
-        async with self.transaction() as connection:
-            self._validate_principal(principal)
-            await self._validate_active_lease_on(connection, principal=principal, timestamp=timestamp)
-            await self._validate_revision_on(connection, expected_revision)
-            blocks = await self._fetchall_on(
-                connection,
-                "SELECT * FROM dispatch_blocks WHERE acknowledged_at IS NULL",
-            )
-            if not blocks:
-                raise StateConflictError("no recovery acknowledgement is required")
-            block = blocks[0]
-            needs_fence = bool(block["requires_fence"]) and block["fenced_at"] is None
-            if needs_fence and fence_evidence is None:
-                raise StateConflictError("prior worker authority has not been fenced")
-            new_revision = await self._increment_revision_on(connection)
-            if fence_evidence is not None and block["fenced_at"] is None:
-                evidence_json = canonical_json(dict(fence_evidence))
-                await connection.execute(
-                    "UPDATE dispatch_blocks SET fence_evidence_json=?, fenced_at=? WHERE dispatch_block_uid=?",
-                    (evidence_json, timestamp, block["dispatch_block_uid"]),
-                )
-                active_workers = await self._fetchall_on(
-                    connection,
-                    """
-                    SELECT worker_instance_uid FROM worker_instances
-                    WHERE state IN ('starting', 'ready', 'stopping')
-                    """,
-                )
-                for worker in active_workers:
-                    await connection.execute(
-                        "UPDATE worker_instances SET state='fenced', exited_at=? WHERE worker_instance_uid=?",
-                        (timestamp, worker["worker_instance_uid"]),
-                    )
-                await self._insert_event_on(
-                    connection,
-                    timestamp=timestamp,
-                    actor_kind=ActorKind.SYSTEM,
-                    actor_id="controller",
-                    event_type="worker.fenced",
-                    queue_revision=new_revision,
-                    worker_instance_uid=(
-                        None if not active_workers else str(active_workers[0]["worker_instance_uid"])
-                    ),
-                    payload=dict(fence_evidence),
-                )
+        await connection.execute(
+            """
+            UPDATE dispatch_blocks
+            SET acknowledged_at=?, acknowledged_by=?, acknowledgement_note=?
+            WHERE dispatch_block_uid=?
+            """,
+            (timestamp, principal, note, block["dispatch_block_uid"]),
+        )
+        await connection.execute("UPDATE controller_metadata SET active_dispatch_block_uid=NULL WHERE singleton=1")
+        if block["queue_execution_uid"] is not None:
             await connection.execute(
                 """
-                UPDATE dispatch_blocks
-                SET acknowledged_at=?, acknowledged_by=?, acknowledgement_note=?
-                WHERE dispatch_block_uid=?
+                UPDATE queue_executions SET state='stopped', updated_at=?, completed_at=?
+                WHERE queue_execution_uid=? AND state='blocked'
                 """,
-                (timestamp, principal, note, block["dispatch_block_uid"]),
+                (timestamp, timestamp, block["queue_execution_uid"]),
             )
-            await connection.execute(
-                "UPDATE controller_metadata SET active_dispatch_block_uid=NULL WHERE singleton=1"
-            )
-            if block["queue_execution_uid"] is not None:
-                await connection.execute(
-                    """
-                    UPDATE queue_executions SET state='stopped', updated_at=?, completed_at=?
-                    WHERE queue_execution_uid=? AND state='blocked'
-                    """,
-                    (timestamp, timestamp, block["queue_execution_uid"]),
-                )
-            await self._insert_event_on(
-                connection,
-                timestamp=timestamp,
-                actor_kind=ActorKind.PRINCIPAL,
-                actor_id=principal,
-                event_type="recovery.acknowledged",
-                queue_revision=new_revision,
-                queue_execution_uid=(
-                    None if block["queue_execution_uid"] is None else str(block["queue_execution_uid"])
-                ),
-                attempt_uid=None if block["attempt_uid"] is None else str(block["attempt_uid"]),
-                payload={"dispatch_block_uid": str(block["dispatch_block_uid"]), "note": note},
-            )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.PRINCIPAL,
+            actor_id=principal,
+            event_type="recovery.acknowledged",
+            queue_revision=new_revision,
+            queue_execution_uid=(
+                None if block["queue_execution_uid"] is None else str(block["queue_execution_uid"])
+            ),
+            attempt_uid=None if block["attempt_uid"] is None else str(block["attempt_uid"]),
+            payload={"dispatch_block_uid": str(block["dispatch_block_uid"]), "note": note},
+        )
         return new_revision
 
     async def _dispatch_block_row_on(
@@ -1235,56 +1267,74 @@ class SQLiteStore:
         now: int | None = None,
     ) -> WorkerInstanceRecord:
         timestamp = self._timestamp(now)
+        async with self._transaction() as connection:
+            return await self._register_ready_worker_on(
+                connection,
+                worker_instance_uid=worker_instance_uid,
+                catalog=catalog,
+                lock_path=lock_path,
+                pid=pid,
+                timestamp=timestamp,
+            )
+
+    async def _register_ready_worker_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        worker_instance_uid: str,
+        catalog: WorkerCatalog,
+        lock_path: str | Path,
+        pid: int | None,
+        timestamp: int,
+    ) -> WorkerInstanceRecord:
         canonical_lock_path = Path(lock_path).resolve(strict=False)
         if canonical_lock_path != self.worker_lock_path:
             raise StorageConfigurationError("worker lock path does not match controller authority metadata")
         catalog_json = canonical_json(catalog.model_dump(mode="json"))
         provenance_json = canonical_json(catalog.worker_provenance)
-        async with self.transaction() as connection:
-            active = await self._fetchall_on(
+        active = await self._fetchall_on(
+            connection,
+            """
+            SELECT worker_instance_uid FROM worker_instances
+            WHERE state IN ('starting', 'ready', 'stopping')
+            """,
+        )
+        if active:
+            raise StateConflictError("a worker instance is already active")
+        await self._validate_catalog_compatibility_on(connection, catalog)
+        await connection.execute(
+            """
+            INSERT INTO worker_instances(
+                worker_instance_uid, worker_revision, worker_provenance_json, catalog_json,
+                state, lock_path, pid, started_at, ready_at
+            ) VALUES (?, ?, ?, ?, 'ready', ?, ?, ?, ?)
+            """,
+            (
+                worker_instance_uid,
+                catalog.worker_revision,
+                provenance_json,
+                catalog_json,
+                str(canonical_lock_path),
+                pid,
+                timestamp,
+                timestamp,
+            ),
+        )
+        for event_type in ("worker.started", "worker.ready"):
+            await self._insert_event_on(
                 connection,
-                """
-                SELECT worker_instance_uid FROM worker_instances
-                WHERE state IN ('starting', 'ready', 'stopping')
-                """,
+                timestamp=timestamp,
+                actor_kind=ActorKind.SYSTEM,
+                actor_id="controller",
+                event_type=event_type,
+                queue_revision=None,
+                worker_instance_uid=worker_instance_uid,
+                payload={
+                    "worker_revision": catalog.worker_revision,
+                    "worker_provenance": catalog.worker_provenance,
+                },
             )
-            if active:
-                raise StateConflictError("a worker instance is already active")
-            await self._validate_catalog_compatibility_on(connection, catalog)
-            await connection.execute(
-                """
-                INSERT INTO worker_instances(
-                    worker_instance_uid, worker_revision, worker_provenance_json, catalog_json,
-                    state, lock_path, pid, started_at, ready_at
-                ) VALUES (?, ?, ?, ?, 'ready', ?, ?, ?, ?)
-                """,
-                (
-                    worker_instance_uid,
-                    catalog.worker_revision,
-                    provenance_json,
-                    catalog_json,
-                    str(canonical_lock_path),
-                    pid,
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            for event_type in ("worker.started", "worker.ready"):
-                await self._insert_event_on(
-                    connection,
-                    timestamp=timestamp,
-                    actor_kind=ActorKind.SYSTEM,
-                    actor_id="controller",
-                    event_type=event_type,
-                    queue_revision=None,
-                    worker_instance_uid=worker_instance_uid,
-                    payload={
-                        "worker_revision": catalog.worker_revision,
-                        "worker_provenance": catalog.worker_provenance,
-                    },
-                )
-            row = await self._worker_instance_row_on(connection, worker_instance_uid)
-        return self._row_to_worker_instance(row)
+        return self._row_to_worker_instance(await self._worker_instance_row_on(connection, worker_instance_uid))
 
     async def mark_worker_exited(
         self,
@@ -1295,30 +1345,46 @@ class SQLiteStore:
         now: int | None = None,
     ) -> WorkerInstanceRecord:
         timestamp = self._timestamp(now)
-        async with self.transaction() as connection:
-            row = await self._worker_instance_row_on(connection, worker_instance_uid)
-            if row["state"] not in {"starting", "ready", "stopping"}:
-                raise StateConflictError(f"worker instance {worker_instance_uid} is not active")
-            state = "faulted" if faulted else "exited"
-            await connection.execute(
-                """
-                UPDATE worker_instances SET state=?, exited_at=?, exit_code=?
-                WHERE worker_instance_uid=?
-                """,
-                (state, timestamp, exit_code, worker_instance_uid),
-            )
-            await self._insert_event_on(
+        async with self._transaction() as connection:
+            return await self._mark_worker_exited_on(
                 connection,
-                timestamp=timestamp,
-                actor_kind=ActorKind.SYSTEM,
-                actor_id="controller",
-                event_type="worker.exited",
-                queue_revision=None,
                 worker_instance_uid=worker_instance_uid,
-                payload={"state": state, "exit_code": exit_code},
+                exit_code=exit_code,
+                faulted=faulted,
+                timestamp=timestamp,
             )
-            updated = await self._worker_instance_row_on(connection, worker_instance_uid)
-        return self._row_to_worker_instance(updated)
+
+    async def _mark_worker_exited_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        worker_instance_uid: str,
+        exit_code: int | None,
+        faulted: bool,
+        timestamp: int,
+    ) -> WorkerInstanceRecord:
+        row = await self._worker_instance_row_on(connection, worker_instance_uid)
+        if row["state"] not in {"starting", "ready", "stopping"}:
+            raise StateConflictError(f"worker instance {worker_instance_uid} is not active")
+        state = "faulted" if faulted else "exited"
+        await connection.execute(
+            """
+            UPDATE worker_instances SET state=?, exited_at=?, exit_code=?
+            WHERE worker_instance_uid=?
+            """,
+            (state, timestamp, exit_code, worker_instance_uid),
+        )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.SYSTEM,
+            actor_id="controller",
+            event_type="worker.exited",
+            queue_revision=None,
+            worker_instance_uid=worker_instance_uid,
+            payload={"state": state, "exit_code": exit_code},
+        )
+        return self._row_to_worker_instance(await self._worker_instance_row_on(connection, worker_instance_uid))
 
     async def _validate_catalog_compatibility_on(
         self,
@@ -1351,19 +1417,25 @@ class SQLiteStore:
 
     async def get_active_worker(self) -> WorkerInstanceRecord | None:
         async with self._transaction_lock:
-            rows = await self._fetchall_on(
-                self._require_connection(),
-                "SELECT * FROM worker_instances WHERE state IN ('starting', 'ready', 'stopping')",
-            )
-            return None if not rows else self._row_to_worker_instance(rows[0])
+            return await self._active_worker_on(self._require_connection())
+
+    async def _active_worker_on(self, connection: aiosqlite.Connection) -> WorkerInstanceRecord | None:
+        rows = await self._fetchall_on(
+            connection,
+            "SELECT * FROM worker_instances WHERE state IN ('starting', 'ready', 'stopping')",
+        )
+        return None if not rows else self._row_to_worker_instance(rows[0])
 
     async def get_control_lease(self) -> ControlLeaseRecord | None:
         async with self._transaction_lock:
-            rows = await self._fetchall_on(
-                self._require_connection(),
-                "SELECT lease_uid, subject, issued_at, expires_at FROM control_lease WHERE singleton=1",
-            )
-            return None if not rows else self._row_to_lease(rows[0])
+            return await self._control_lease_on(self._require_connection())
+
+    async def _control_lease_on(self, connection: aiosqlite.Connection) -> ControlLeaseRecord | None:
+        rows = await self._fetchall_on(
+            connection,
+            "SELECT lease_uid, subject, issued_at, expires_at FROM control_lease WHERE singleton=1",
+        )
+        return None if not rows else self._row_to_lease(rows[0])
 
     async def acquire_control_lease(
         self,
@@ -1372,36 +1444,53 @@ class SQLiteStore:
         ttl_seconds: int = 300,
         now: int | None = None,
     ) -> ControlLeaseRecord:
+        timestamp = self._timestamp(now)
+        lease_uid = str(uuid4())
+        async with self._transaction() as connection:
+            return await self._acquire_control_lease_on(
+                connection,
+                principal=principal,
+                ttl_seconds=ttl_seconds,
+                timestamp=timestamp,
+                lease_uid=lease_uid,
+            )
+
+    async def _acquire_control_lease_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        principal: str,
+        ttl_seconds: int,
+        timestamp: int,
+        lease_uid: str,
+    ) -> ControlLeaseRecord:
         self._validate_principal(principal)
         self._validate_lease_ttl(ttl_seconds)
-        timestamp = self._timestamp(now)
         expires_at = timestamp + ttl_seconds * 1_000_000
-        lease_uid = str(uuid4())
-        async with self.transaction() as connection:
-            rows = await self._fetchall_on(
-                connection,
-                "SELECT lease_uid, subject, issued_at, expires_at FROM control_lease WHERE singleton=1",
-            )
-            if rows and int(rows[0]["expires_at"]) > timestamp:
-                raise LeaseConflictError(f"control lease is held by {rows[0]['subject']!r}")
-            if rows:
-                await self._expire_lease_on(connection, row=rows[0], timestamp=timestamp)
-            await connection.execute(
-                """
-                INSERT INTO control_lease(singleton, lease_uid, subject, issued_at, expires_at)
-                VALUES (1, ?, ?, ?, ?)
-                """,
-                (lease_uid, principal, timestamp, expires_at),
-            )
-            await self._insert_event_on(
-                connection,
-                timestamp=timestamp,
-                actor_kind=ActorKind.PRINCIPAL,
-                actor_id=principal,
-                event_type="lease.acquired",
-                queue_revision=None,
-                payload={"expires_at": expires_at},
-            )
+        rows = await self._fetchall_on(
+            connection,
+            "SELECT lease_uid, subject, issued_at, expires_at FROM control_lease WHERE singleton=1",
+        )
+        if rows and int(rows[0]["expires_at"]) > timestamp:
+            raise LeaseConflictError(f"control lease is held by {rows[0]['subject']!r}")
+        if rows:
+            await self._expire_lease_on(connection, row=rows[0], timestamp=timestamp)
+        await connection.execute(
+            """
+            INSERT INTO control_lease(singleton, lease_uid, subject, issued_at, expires_at)
+            VALUES (1, ?, ?, ?, ?)
+            """,
+            (lease_uid, principal, timestamp, expires_at),
+        )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.PRINCIPAL,
+            actor_id=principal,
+            event_type="lease.acquired",
+            queue_revision=None,
+            payload={"expires_at": expires_at},
+        )
         return ControlLeaseRecord(
             lease_uid=lease_uid,
             subject=principal,
@@ -1416,80 +1505,107 @@ class SQLiteStore:
         ttl_seconds: int = 300,
         now: int | None = None,
     ) -> ControlLeaseRecord:
-        self._validate_principal(principal)
-        self._validate_lease_ttl(ttl_seconds)
         timestamp = self._timestamp(now)
-        expires_at = timestamp + ttl_seconds * 1_000_000
-        expired = False
-        lease: ControlLeaseRecord | None = None
-        async with self.transaction() as connection:
-            rows = await self._fetchall_on(
+        async with self._transaction() as connection:
+            lease, expired = await self._renew_control_lease_on(
                 connection,
-                "SELECT lease_uid, subject, issued_at, expires_at FROM control_lease WHERE singleton=1",
+                principal=principal,
+                ttl_seconds=ttl_seconds,
+                timestamp=timestamp,
             )
-            if not rows:
-                raise LeaseOwnershipError("no control lease is active")
-            row = rows[0]
-            if int(row["expires_at"]) <= timestamp:
-                await self._expire_lease_on(connection, row=row, timestamp=timestamp)
-                expired = True
-            elif str(row["subject"]) != principal:
-                raise LeaseOwnershipError("control lease belongs to another principal")
-            else:
-                await connection.execute(
-                    "UPDATE control_lease SET expires_at=? WHERE singleton=1",
-                    (expires_at,),
-                )
-                await self._insert_event_on(
-                    connection,
-                    timestamp=timestamp,
-                    actor_kind=ActorKind.PRINCIPAL,
-                    actor_id=principal,
-                    event_type="lease.renewed",
-                    queue_revision=None,
-                    payload={"expires_at": expires_at},
-                )
-                lease = ControlLeaseRecord(
-                    lease_uid=str(row["lease_uid"]),
-                    subject=principal,
-                    issued_at=int(row["issued_at"]),
-                    expires_at=expires_at,
-                )
         if expired:
             raise LeaseExpiredError("control lease has expired")
         assert lease is not None
         return lease
 
-    async def release_control_lease(self, *, principal: str, now: int | None = None) -> None:
+    async def _renew_control_lease_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        principal: str,
+        ttl_seconds: int,
+        timestamp: int,
+    ) -> tuple[ControlLeaseRecord | None, bool]:
         self._validate_principal(principal)
+        self._validate_lease_ttl(ttl_seconds)
+        expires_at = timestamp + ttl_seconds * 1_000_000
+        rows = await self._fetchall_on(
+            connection,
+            "SELECT lease_uid, subject, issued_at, expires_at FROM control_lease WHERE singleton=1",
+        )
+        if not rows:
+            raise LeaseOwnershipError("no control lease is active")
+        row = rows[0]
+        if int(row["expires_at"]) <= timestamp:
+            await self._expire_lease_on(connection, row=row, timestamp=timestamp)
+            return None, True
+        if str(row["subject"]) != principal:
+            raise LeaseOwnershipError("control lease belongs to another principal")
+        await connection.execute(
+            "UPDATE control_lease SET expires_at=? WHERE singleton=1",
+            (expires_at,),
+        )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.PRINCIPAL,
+            actor_id=principal,
+            event_type="lease.renewed",
+            queue_revision=None,
+            payload={"expires_at": expires_at},
+        )
+        return (
+            ControlLeaseRecord(
+                lease_uid=str(row["lease_uid"]),
+                subject=principal,
+                issued_at=int(row["issued_at"]),
+                expires_at=expires_at,
+            ),
+            False,
+        )
+
+    async def release_control_lease(self, *, principal: str, now: int | None = None) -> None:
         timestamp = self._timestamp(now)
-        expired = False
-        async with self.transaction() as connection:
-            rows = await self._fetchall_on(
+        async with self._transaction() as connection:
+            expired = await self._release_control_lease_on(
                 connection,
-                "SELECT lease_uid, subject, issued_at, expires_at FROM control_lease WHERE singleton=1",
+                principal=principal,
+                timestamp=timestamp,
             )
-            if not rows:
-                raise LeaseOwnershipError("no control lease is active")
-            row = rows[0]
-            if int(row["expires_at"]) <= timestamp:
-                await self._expire_lease_on(connection, row=row, timestamp=timestamp)
-                expired = True
-            elif str(row["subject"]) != principal:
-                raise LeaseOwnershipError("control lease belongs to another principal")
-            else:
-                await connection.execute("DELETE FROM control_lease WHERE singleton=1")
-                await self._insert_event_on(
-                    connection,
-                    timestamp=timestamp,
-                    actor_kind=ActorKind.PRINCIPAL,
-                    actor_id=principal,
-                    event_type="lease.released",
-                    queue_revision=None,
-                    payload={},
-                )
         if expired:
             raise LeaseExpiredError("control lease has expired")
+
+    async def _release_control_lease_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        principal: str,
+        timestamp: int,
+    ) -> bool:
+        self._validate_principal(principal)
+        rows = await self._fetchall_on(
+            connection,
+            "SELECT lease_uid, subject, issued_at, expires_at FROM control_lease WHERE singleton=1",
+        )
+        if not rows:
+            raise LeaseOwnershipError("no control lease is active")
+        row = rows[0]
+        if int(row["expires_at"]) <= timestamp:
+            await self._expire_lease_on(connection, row=row, timestamp=timestamp)
+            return True
+        if str(row["subject"]) != principal:
+            raise LeaseOwnershipError("control lease belongs to another principal")
+        await connection.execute("DELETE FROM control_lease WHERE singleton=1")
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.PRINCIPAL,
+            actor_id=principal,
+            event_type="lease.released",
+            queue_revision=None,
+            payload={},
+        )
+        return False
 
     async def override_control_lease(
         self,
@@ -1499,37 +1615,56 @@ class SQLiteStore:
         ttl_seconds: int = 300,
         now: int | None = None,
     ) -> ControlLeaseRecord:
+        timestamp = self._timestamp(now)
+        lease_uid = str(uuid4())
+        async with self._transaction() as connection:
+            return await self._override_control_lease_on(
+                connection,
+                administrator=administrator,
+                reason=reason,
+                ttl_seconds=ttl_seconds,
+                timestamp=timestamp,
+                lease_uid=lease_uid,
+            )
+
+    async def _override_control_lease_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        administrator: str,
+        reason: str,
+        ttl_seconds: int,
+        timestamp: int,
+        lease_uid: str,
+    ) -> ControlLeaseRecord:
         self._validate_principal(administrator)
         if not reason.strip() or len(reason) > 1000:
             raise ValueError("override reason must be nonblank and at most 1000 characters")
         self._validate_lease_ttl(ttl_seconds)
-        timestamp = self._timestamp(now)
         expires_at = timestamp + ttl_seconds * 1_000_000
-        lease_uid = str(uuid4())
-        async with self.transaction() as connection:
-            rows = await self._fetchall_on(
-                connection,
-                "SELECT lease_uid, subject, issued_at, expires_at FROM control_lease WHERE singleton=1",
-            )
-            previous_holder = None if not rows else str(rows[0]["subject"])
-            if rows:
-                await connection.execute("DELETE FROM control_lease WHERE singleton=1")
-            await connection.execute(
-                """
-                INSERT INTO control_lease(singleton, lease_uid, subject, issued_at, expires_at)
-                VALUES (1, ?, ?, ?, ?)
-                """,
-                (lease_uid, administrator, timestamp, expires_at),
-            )
-            await self._insert_event_on(
-                connection,
-                timestamp=timestamp,
-                actor_kind=ActorKind.PRINCIPAL,
-                actor_id=administrator,
-                event_type="lease.overridden",
-                queue_revision=None,
-                payload={"previous_holder": previous_holder, "reason": reason, "expires_at": expires_at},
-            )
+        rows = await self._fetchall_on(
+            connection,
+            "SELECT lease_uid, subject, issued_at, expires_at FROM control_lease WHERE singleton=1",
+        )
+        previous_holder = None if not rows else str(rows[0]["subject"])
+        if rows:
+            await connection.execute("DELETE FROM control_lease WHERE singleton=1")
+        await connection.execute(
+            """
+            INSERT INTO control_lease(singleton, lease_uid, subject, issued_at, expires_at)
+            VALUES (1, ?, ?, ?, ?)
+            """,
+            (lease_uid, administrator, timestamp, expires_at),
+        )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.PRINCIPAL,
+            actor_id=administrator,
+            event_type="lease.overridden",
+            queue_revision=None,
+            payload={"previous_holder": previous_holder, "reason": reason, "expires_at": expires_at},
+        )
         return ControlLeaseRecord(
             lease_uid=lease_uid,
             subject=administrator,
@@ -1539,16 +1674,23 @@ class SQLiteStore:
 
     async def expire_control_lease(self, *, now: int | None = None) -> bool:
         timestamp = self._timestamp(now)
-        expired = False
-        async with self.transaction() as connection:
-            rows = await self._fetchall_on(
-                connection,
-                "SELECT lease_uid, subject, issued_at, expires_at FROM control_lease WHERE singleton=1",
-            )
-            if rows and int(rows[0]["expires_at"]) <= timestamp:
-                await self._expire_lease_on(connection, row=rows[0], timestamp=timestamp)
-                expired = True
-        return expired
+        async with self._transaction() as connection:
+            return await self._expire_control_lease_on(connection, timestamp=timestamp)
+
+    async def _expire_control_lease_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        timestamp: int,
+    ) -> bool:
+        rows = await self._fetchall_on(
+            connection,
+            "SELECT lease_uid, subject, issued_at, expires_at FROM control_lease WHERE singleton=1",
+        )
+        if rows and int(rows[0]["expires_at"]) <= timestamp:
+            await self._expire_lease_on(connection, row=rows[0], timestamp=timestamp)
+            return True
+        return False
 
     async def _expire_lease_on(
         self,
@@ -1639,52 +1781,63 @@ class SQLiteStore:
 
     async def current_revision(self) -> int:
         async with self._transaction_lock:
-            row = await self._fetchone_on(
-                self._require_connection(),
-                "SELECT queue_revision FROM controller_metadata WHERE singleton=1",
-            )
-            return int(row["queue_revision"])
+            return await self._current_revision_on(self._require_connection())
+
+    async def _current_revision_on(self, connection: aiosqlite.Connection) -> int:
+        row = await self._fetchone_on(
+            connection,
+            "SELECT queue_revision FROM controller_metadata WHERE singleton=1",
+        )
+        return int(row["queue_revision"])
 
     async def get_operation(self, operation_uid: str) -> OperationRecord:
         async with self._transaction_lock:
-            row = await self._operation_row_on(self._require_connection(), operation_uid)
-            return self._row_to_operation(row)
+            return await self._operation_record_on(self._require_connection(), operation_uid)
+
+    async def _operation_record_on(
+        self,
+        connection: aiosqlite.Connection,
+        operation_uid: str,
+    ) -> OperationRecord:
+        return self._row_to_operation(await self._operation_row_on(connection, operation_uid))
 
     async def queue_snapshot(self) -> QueueRecord:
         async with self._transaction_lock:
-            connection = self._require_connection()
-            metadata = await self._fetchone_on(
-                connection,
-                "SELECT queue_revision, active_dispatch_block_uid FROM controller_metadata WHERE singleton=1",
-            )
-            rows = await self._fetchall_on(
-                connection,
-                """
-                SELECT operations.*, queue_entries.position AS queue_position
-                FROM queue_entries
-                JOIN operations USING(operation_uid)
-                ORDER BY queue_entries.position
-                """,
-            )
-            active_execution = await self._fetchall_on(
-                connection,
-                """
-                SELECT queue_execution_uid FROM queue_executions
-                WHERE state IN ('running', 'stopping', 'blocked')
-                """,
-            )
-            return QueueRecord(
-                revision=int(metadata["queue_revision"]),
-                operations=tuple(self._row_to_operation(row) for row in rows),
-                active_execution_uid=(
-                    None if not active_execution else str(active_execution[0]["queue_execution_uid"])
-                ),
-                dispatch_block_uid=(
-                    None
-                    if metadata["active_dispatch_block_uid"] is None
-                    else str(metadata["active_dispatch_block_uid"])
-                ),
-            )
+            return await self._queue_snapshot_on(self._require_connection())
+
+    async def _queue_snapshot_on(self, connection: aiosqlite.Connection) -> QueueRecord:
+        metadata = await self._fetchone_on(
+            connection,
+            "SELECT queue_revision, active_dispatch_block_uid FROM controller_metadata WHERE singleton=1",
+        )
+        rows = await self._fetchall_on(
+            connection,
+            """
+            SELECT operations.*, queue_entries.position AS queue_position
+            FROM queue_entries
+            JOIN operations USING(operation_uid)
+            ORDER BY queue_entries.position
+            """,
+        )
+        active_execution = await self._fetchall_on(
+            connection,
+            """
+            SELECT queue_execution_uid FROM queue_executions
+            WHERE state IN ('running', 'stopping', 'blocked')
+            """,
+        )
+        return QueueRecord(
+            revision=int(metadata["queue_revision"]),
+            operations=tuple(self._row_to_operation(row) for row in rows),
+            active_execution_uid=(
+                None if not active_execution else str(active_execution[0]["queue_execution_uid"])
+            ),
+            dispatch_block_uid=(
+                None
+                if metadata["active_dispatch_block_uid"] is None
+                else str(metadata["active_dispatch_block_uid"])
+            ),
+        )
 
     async def submit_operation(
         self,
@@ -1708,79 +1861,101 @@ class SQLiteStore:
         operation_uid = str(uuid4())
         timestamp = self._timestamp(now)
         await self.expire_control_lease(now=timestamp)
-        async with self.transaction() as connection:
-            self._validate_principal(principal)
-            await self._validate_active_lease_on(connection, principal=principal, timestamp=timestamp)
-            await self._validate_revision_on(connection, expected_revision)
-            position = int(
-                (
-                    await self._fetchone_on(
-                        connection,
-                        "SELECT COALESCE(MAX(position), -1) + 1 AS next_position FROM queue_entries",
-                    )
-                )["next_position"]
-            )
-            new_revision = await self._increment_revision_on(connection)
-            await connection.execute(
-                """
-                INSERT INTO operations(
-                    operation_uid, operation_id, operation_version, parameters_json,
-                    descriptor_fingerprint, submitted_by, state, submitted_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    operation_uid,
-                    descriptor.operation_id,
-                    descriptor.operation_version,
-                    parameters_json,
-                    fingerprint,
-                    principal,
-                    OperationState.SUBMITTED.value,
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            await self._insert_event_on(
+        async with self._transaction() as connection:
+            return await self._submit_operation_on(
                 connection,
-                timestamp=timestamp,
-                actor_kind=ActorKind.PRINCIPAL,
-                actor_id=principal,
-                event_type="operation.submitted",
-                queue_revision=new_revision,
+                principal=principal,
+                expected_revision=expected_revision,
+                descriptor=descriptor,
+                parameters_json=parameters_json,
+                fingerprint=fingerprint,
                 operation_uid=operation_uid,
-                payload={
-                    "operation_id": descriptor.operation_id,
-                    "operation_version": descriptor.operation_version,
-                    "descriptor_fingerprint": fingerprint,
-                },
-            )
-            await connection.execute(
-                "UPDATE operations SET state=? WHERE operation_uid=?",
-                (OperationState.QUEUED.value, operation_uid),
-            )
-            await connection.execute(
-                "INSERT INTO queue_entries(operation_uid, position, enqueued_at) VALUES (?, ?, ?)",
-                (operation_uid, position, timestamp),
-            )
-            await self._insert_event_on(
-                connection,
                 timestamp=timestamp,
-                actor_kind=ActorKind.PRINCIPAL,
-                actor_id=principal,
-                event_type="operation.queued",
-                queue_revision=new_revision,
-                operation_uid=operation_uid,
-                payload={"position": position},
             )
-            await self._admit_if_running_on(
-                connection,
-                operation_uid=operation_uid,
-                actor_id=principal,
-                timestamp=timestamp,
-                queue_revision=new_revision,
-            )
-            row = await self._operation_row_on(connection, operation_uid)
-        return self._row_to_operation(row), new_revision
+
+    async def _submit_operation_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        principal: str,
+        expected_revision: int,
+        descriptor: OperationDescriptor,
+        parameters_json: str,
+        fingerprint: str,
+        operation_uid: str,
+        timestamp: int,
+    ) -> tuple[OperationRecord, int]:
+        self._validate_principal(principal)
+        await self._validate_active_lease_on(connection, principal=principal, timestamp=timestamp)
+        await self._validate_revision_on(connection, expected_revision)
+        position = int(
+            (
+                await self._fetchone_on(
+                    connection,
+                    "SELECT COALESCE(MAX(position), -1) + 1 AS next_position FROM queue_entries",
+                )
+            )["next_position"]
+        )
+        new_revision = await self._increment_revision_on(connection)
+        await connection.execute(
+            """
+            INSERT INTO operations(
+                operation_uid, operation_id, operation_version, parameters_json,
+                descriptor_fingerprint, submitted_by, state, submitted_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                operation_uid,
+                descriptor.operation_id,
+                descriptor.operation_version,
+                parameters_json,
+                fingerprint,
+                principal,
+                OperationState.SUBMITTED.value,
+                timestamp,
+                timestamp,
+            ),
+        )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.PRINCIPAL,
+            actor_id=principal,
+            event_type="operation.submitted",
+            queue_revision=new_revision,
+            operation_uid=operation_uid,
+            payload={
+                "operation_id": descriptor.operation_id,
+                "operation_version": descriptor.operation_version,
+                "descriptor_fingerprint": fingerprint,
+            },
+        )
+        await connection.execute(
+            "UPDATE operations SET state=? WHERE operation_uid=?",
+            (OperationState.QUEUED.value, operation_uid),
+        )
+        await connection.execute(
+            "INSERT INTO queue_entries(operation_uid, position, enqueued_at) VALUES (?, ?, ?)",
+            (operation_uid, position, timestamp),
+        )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.PRINCIPAL,
+            actor_id=principal,
+            event_type="operation.queued",
+            queue_revision=new_revision,
+            operation_uid=operation_uid,
+            payload={"position": position},
+        )
+        await self._admit_if_running_on(
+            connection,
+            operation_uid=operation_uid,
+            actor_id=principal,
+            timestamp=timestamp,
+            queue_revision=new_revision,
+        )
+        return await self._operation_record_on(connection, operation_uid), new_revision
 
     async def cancel_operation(
         self,
@@ -1792,37 +1967,53 @@ class SQLiteStore:
     ) -> tuple[OperationRecord, int]:
         timestamp = self._timestamp(now)
         await self.expire_control_lease(now=timestamp)
-        async with self.transaction() as connection:
-            self._validate_principal(principal)
-            await self._validate_active_lease_on(connection, principal=principal, timestamp=timestamp)
-            await self._validate_revision_on(connection, expected_revision)
-            row = await self._operation_row_on(connection, operation_uid)
-            if row["state"] != OperationState.QUEUED.value or row["queue_position"] is None:
-                raise StateConflictError(f"operation {operation_uid} is not queued")
-            await connection.execute("DELETE FROM queue_entries WHERE operation_uid=?", (operation_uid,))
-            await connection.execute(
-                "UPDATE operations SET state=?, updated_at=? WHERE operation_uid=?",
-                (OperationState.CANCELLED.value, timestamp, operation_uid),
-            )
-            await self._compact_queue_positions_on(connection)
-            new_revision = await self._increment_revision_on(connection)
-            await self._insert_event_on(
+        async with self._transaction() as connection:
+            return await self._cancel_operation_on(
                 connection,
-                timestamp=timestamp,
-                actor_kind=ActorKind.PRINCIPAL,
-                actor_id=principal,
-                event_type="operation.cancelled",
-                queue_revision=new_revision,
+                principal=principal,
+                expected_revision=expected_revision,
                 operation_uid=operation_uid,
-                payload={},
-            )
-            await self._maybe_finish_execution_on(
-                connection,
                 timestamp=timestamp,
-                queue_revision=new_revision,
             )
-            updated = await self._operation_row_on(connection, operation_uid)
-        return self._row_to_operation(updated), new_revision
+
+    async def _cancel_operation_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        principal: str,
+        expected_revision: int,
+        operation_uid: str,
+        timestamp: int,
+    ) -> tuple[OperationRecord, int]:
+        self._validate_principal(principal)
+        await self._validate_active_lease_on(connection, principal=principal, timestamp=timestamp)
+        await self._validate_revision_on(connection, expected_revision)
+        row = await self._operation_row_on(connection, operation_uid)
+        if row["state"] != OperationState.QUEUED.value or row["queue_position"] is None:
+            raise StateConflictError(f"operation {operation_uid} is not queued")
+        await connection.execute("DELETE FROM queue_entries WHERE operation_uid=?", (operation_uid,))
+        await connection.execute(
+            "UPDATE operations SET state=?, updated_at=? WHERE operation_uid=?",
+            (OperationState.CANCELLED.value, timestamp, operation_uid),
+        )
+        await self._compact_queue_positions_on(connection)
+        new_revision = await self._increment_revision_on(connection)
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.PRINCIPAL,
+            actor_id=principal,
+            event_type="operation.cancelled",
+            queue_revision=new_revision,
+            operation_uid=operation_uid,
+            payload={},
+        )
+        await self._maybe_finish_execution_on(
+            connection,
+            timestamp=timestamp,
+            queue_revision=new_revision,
+        )
+        return await self._operation_record_on(connection, operation_uid), new_revision
 
     async def replace_operation(
         self,
@@ -1847,87 +2038,111 @@ class SQLiteStore:
         replacement_uid = str(uuid4())
         timestamp = self._timestamp(now)
         await self.expire_control_lease(now=timestamp)
-        async with self.transaction() as connection:
-            self._validate_principal(principal)
-            await self._validate_active_lease_on(connection, principal=principal, timestamp=timestamp)
-            await self._validate_revision_on(connection, expected_revision)
-            row = await self._operation_row_on(connection, operation_uid)
-            if row["state"] != OperationState.QUEUED.value or row["queue_position"] is None:
-                raise StateConflictError(f"operation {operation_uid} is not queued")
-            position = int(row["queue_position"])
-            new_revision = await self._increment_revision_on(connection)
-            await connection.execute("DELETE FROM queue_entries WHERE operation_uid=?", (operation_uid,))
-            await connection.execute(
-                """
-                INSERT INTO operations(
-                    operation_uid, operation_id, operation_version, parameters_json,
-                    descriptor_fingerprint, submitted_by, state, submitted_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    replacement_uid,
-                    descriptor.operation_id,
-                    descriptor.operation_version,
-                    parameters_json,
-                    fingerprint,
-                    principal,
-                    OperationState.QUEUED.value,
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            await connection.execute(
-                "INSERT INTO queue_entries(operation_uid, position, enqueued_at) VALUES (?, ?, ?)",
-                (replacement_uid, position, timestamp),
-            )
-            await connection.execute(
-                "UPDATE operations SET state=?, updated_at=?, replaced_by=? WHERE operation_uid=?",
-                (OperationState.CANCELLED.value, timestamp, replacement_uid, operation_uid),
-            )
-            await self._insert_event_on(
+        async with self._transaction() as connection:
+            return await self._replace_operation_on(
                 connection,
-                timestamp=timestamp,
-                actor_kind=ActorKind.PRINCIPAL,
-                actor_id=principal,
-                event_type="operation.replaced",
-                queue_revision=new_revision,
+                principal=principal,
+                expected_revision=expected_revision,
                 operation_uid=operation_uid,
-                payload={"replacement_operation_uid": replacement_uid, "position": position},
-            )
-            await self._insert_event_on(
-                connection,
+                descriptor=descriptor,
+                parameters_json=parameters_json,
+                fingerprint=fingerprint,
+                replacement_uid=replacement_uid,
                 timestamp=timestamp,
-                actor_kind=ActorKind.PRINCIPAL,
-                actor_id=principal,
-                event_type="operation.submitted",
-                queue_revision=new_revision,
-                operation_uid=replacement_uid,
-                payload={
-                    "operation_id": descriptor.operation_id,
-                    "operation_version": descriptor.operation_version,
-                    "descriptor_fingerprint": fingerprint,
-                    "replaces": operation_uid,
-                },
             )
-            await self._insert_event_on(
-                connection,
-                timestamp=timestamp,
-                actor_kind=ActorKind.PRINCIPAL,
-                actor_id=principal,
-                event_type="operation.queued",
-                queue_revision=new_revision,
-                operation_uid=replacement_uid,
-                payload={"position": position},
-            )
-            await self._admit_if_running_on(
-                connection,
-                operation_uid=replacement_uid,
-                actor_id=principal,
-                timestamp=timestamp,
-                queue_revision=new_revision,
-            )
-            replacement = await self._operation_row_on(connection, replacement_uid)
-        return self._row_to_operation(replacement), new_revision
+
+    async def _replace_operation_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        principal: str,
+        expected_revision: int,
+        operation_uid: str,
+        descriptor: OperationDescriptor,
+        parameters_json: str,
+        fingerprint: str,
+        replacement_uid: str,
+        timestamp: int,
+    ) -> tuple[OperationRecord, int]:
+        self._validate_principal(principal)
+        await self._validate_active_lease_on(connection, principal=principal, timestamp=timestamp)
+        await self._validate_revision_on(connection, expected_revision)
+        row = await self._operation_row_on(connection, operation_uid)
+        if row["state"] != OperationState.QUEUED.value or row["queue_position"] is None:
+            raise StateConflictError(f"operation {operation_uid} is not queued")
+        position = int(row["queue_position"])
+        new_revision = await self._increment_revision_on(connection)
+        await connection.execute("DELETE FROM queue_entries WHERE operation_uid=?", (operation_uid,))
+        await connection.execute(
+            """
+            INSERT INTO operations(
+                operation_uid, operation_id, operation_version, parameters_json,
+                descriptor_fingerprint, submitted_by, state, submitted_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                replacement_uid,
+                descriptor.operation_id,
+                descriptor.operation_version,
+                parameters_json,
+                fingerprint,
+                principal,
+                OperationState.QUEUED.value,
+                timestamp,
+                timestamp,
+            ),
+        )
+        await connection.execute(
+            "INSERT INTO queue_entries(operation_uid, position, enqueued_at) VALUES (?, ?, ?)",
+            (replacement_uid, position, timestamp),
+        )
+        await connection.execute(
+            "UPDATE operations SET state=?, updated_at=?, replaced_by=? WHERE operation_uid=?",
+            (OperationState.CANCELLED.value, timestamp, replacement_uid, operation_uid),
+        )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.PRINCIPAL,
+            actor_id=principal,
+            event_type="operation.replaced",
+            queue_revision=new_revision,
+            operation_uid=operation_uid,
+            payload={"replacement_operation_uid": replacement_uid, "position": position},
+        )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.PRINCIPAL,
+            actor_id=principal,
+            event_type="operation.submitted",
+            queue_revision=new_revision,
+            operation_uid=replacement_uid,
+            payload={
+                "operation_id": descriptor.operation_id,
+                "operation_version": descriptor.operation_version,
+                "descriptor_fingerprint": fingerprint,
+                "replaces": operation_uid,
+            },
+        )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.PRINCIPAL,
+            actor_id=principal,
+            event_type="operation.queued",
+            queue_revision=new_revision,
+            operation_uid=replacement_uid,
+            payload={"position": position},
+        )
+        await self._admit_if_running_on(
+            connection,
+            operation_uid=replacement_uid,
+            actor_id=principal,
+            timestamp=timestamp,
+            queue_revision=new_revision,
+        )
+        return await self._operation_record_on(connection, replacement_uid), new_revision
 
     async def reorder_queue(
         self,
@@ -1941,41 +2156,56 @@ class SQLiteStore:
             raise QueueValidationError("queue reorder contains duplicate operation UIDs")
         timestamp = self._timestamp(now)
         await self.expire_control_lease(now=timestamp)
-        async with self.transaction() as connection:
-            self._validate_principal(principal)
-            await self._validate_active_lease_on(connection, principal=principal, timestamp=timestamp)
-            await self._validate_revision_on(connection, expected_revision)
-            current_rows = await self._fetchall_on(
+        async with self._transaction() as connection:
+            return await self._reorder_queue_on(
                 connection,
-                "SELECT operation_uid FROM queue_entries ORDER BY position",
-            )
-            current = [str(row["operation_uid"]) for row in current_rows]
-            if len(operation_uids) != len(current) or set(operation_uids) != set(current):
-                raise QueueValidationError(
-                    "queue reorder must contain every currently queued operation exactly once"
-                )
-            offset = len(current) + 1
-            for index, operation_uid in enumerate(operation_uids):
-                await connection.execute(
-                    "UPDATE queue_entries SET position=? WHERE operation_uid=?",
-                    (offset + index, operation_uid),
-                )
-            for index, operation_uid in enumerate(operation_uids):
-                await connection.execute(
-                    "UPDATE queue_entries SET position=? WHERE operation_uid=?",
-                    (index, operation_uid),
-                )
-            new_revision = await self._increment_revision_on(connection)
-            await self._insert_event_on(
-                connection,
+                principal=principal,
+                expected_revision=expected_revision,
+                operation_uids=operation_uids,
                 timestamp=timestamp,
-                actor_kind=ActorKind.PRINCIPAL,
-                actor_id=principal,
-                event_type="queue.reordered",
-                queue_revision=new_revision,
-                payload={"operation_uids": operation_uids},
             )
-        return await self.queue_snapshot()
+
+    async def _reorder_queue_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        principal: str,
+        expected_revision: int,
+        operation_uids: list[str],
+        timestamp: int,
+    ) -> QueueRecord:
+        self._validate_principal(principal)
+        await self._validate_active_lease_on(connection, principal=principal, timestamp=timestamp)
+        await self._validate_revision_on(connection, expected_revision)
+        current_rows = await self._fetchall_on(
+            connection,
+            "SELECT operation_uid FROM queue_entries ORDER BY position",
+        )
+        current = [str(row["operation_uid"]) for row in current_rows]
+        if len(operation_uids) != len(current) or set(operation_uids) != set(current):
+            raise QueueValidationError("queue reorder must contain every currently queued operation exactly once")
+        offset = len(current) + 1
+        for index, operation_uid in enumerate(operation_uids):
+            await connection.execute(
+                "UPDATE queue_entries SET position=? WHERE operation_uid=?",
+                (offset + index, operation_uid),
+            )
+        for index, operation_uid in enumerate(operation_uids):
+            await connection.execute(
+                "UPDATE queue_entries SET position=? WHERE operation_uid=?",
+                (index, operation_uid),
+            )
+        new_revision = await self._increment_revision_on(connection)
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.PRINCIPAL,
+            actor_id=principal,
+            event_type="queue.reordered",
+            queue_revision=new_revision,
+            payload={"operation_uids": operation_uids},
+        )
+        return await self._queue_snapshot_on(connection)
 
     async def get_queue_execution(self, queue_execution_uid: str) -> QueueExecutionRecord:
         async with self._transaction_lock:
@@ -1995,77 +2225,95 @@ class SQLiteStore:
         timestamp = self._timestamp(now)
         queue_execution_uid = str(uuid4())
         await self.expire_control_lease(now=timestamp)
-        async with self.transaction() as connection:
-            self._validate_principal(principal)
-            await self._validate_active_lease_on(connection, principal=principal, timestamp=timestamp)
-            await self._validate_revision_on(connection, expected_revision)
-            active = await self._fetchall_on(
+        async with self._transaction() as connection:
+            return await self._start_queue_execution_on(
                 connection,
-                """
-                SELECT queue_execution_uid FROM queue_executions
-                WHERE state IN ('running', 'stopping', 'blocked')
-                """,
+                principal=principal,
+                expected_revision=expected_revision,
+                policy=policy,
+                timestamp=timestamp,
+                queue_execution_uid=queue_execution_uid,
             )
-            if active:
-                raise StateConflictError("a queue execution is already active")
-            queued = await self._fetchall_on(
-                connection,
-                "SELECT operation_uid FROM queue_entries ORDER BY position",
-            )
-            if not queued:
-                raise StateConflictError("cannot start a queue execution for an empty queue")
-            new_revision = await self._increment_revision_on(connection)
+
+    async def _start_queue_execution_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        principal: str,
+        expected_revision: int,
+        policy: QueueExecutionPolicy,
+        timestamp: int,
+        queue_execution_uid: str,
+    ) -> tuple[QueueExecutionRecord, int]:
+        self._validate_principal(principal)
+        await self._validate_active_lease_on(connection, principal=principal, timestamp=timestamp)
+        await self._validate_revision_on(connection, expected_revision)
+        active = await self._fetchall_on(
+            connection,
+            """
+            SELECT queue_execution_uid FROM queue_executions
+            WHERE state IN ('running', 'stopping', 'blocked')
+            """,
+        )
+        if active:
+            raise StateConflictError("a queue execution is already active")
+        queued = await self._fetchall_on(
+            connection,
+            "SELECT operation_uid FROM queue_entries ORDER BY position",
+        )
+        if not queued:
+            raise StateConflictError("cannot start a queue execution for an empty queue")
+        new_revision = await self._increment_revision_on(connection)
+        await connection.execute(
+            """
+            INSERT INTO queue_executions(
+                queue_execution_uid, state, policy, initiated_by,
+                starting_revision, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                queue_execution_uid,
+                QueueExecutionState.RUNNING.value,
+                policy.value,
+                principal,
+                expected_revision,
+                timestamp,
+                timestamp,
+            ),
+        )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.PRINCIPAL,
+            actor_id=principal,
+            event_type="queue_execution.started",
+            queue_revision=new_revision,
+            queue_execution_uid=queue_execution_uid,
+            payload={"policy": policy.value, "starting_revision": expected_revision},
+        )
+        for admission_order, row in enumerate(queued):
+            operation_uid = str(row["operation_uid"])
             await connection.execute(
                 """
-                INSERT INTO queue_executions(
-                    queue_execution_uid, state, policy, initiated_by,
-                    starting_revision, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO queue_execution_admissions(
+                    queue_execution_uid, operation_uid, admitted_at,
+                    admission_revision, admission_order
+                ) VALUES (?, ?, ?, ?, ?)
                 """,
-                (
-                    queue_execution_uid,
-                    QueueExecutionState.RUNNING.value,
-                    policy.value,
-                    principal,
-                    expected_revision,
-                    timestamp,
-                    timestamp,
-                ),
+                (queue_execution_uid, operation_uid, timestamp, new_revision, admission_order),
             )
             await self._insert_event_on(
                 connection,
                 timestamp=timestamp,
                 actor_kind=ActorKind.PRINCIPAL,
                 actor_id=principal,
-                event_type="queue_execution.started",
+                event_type="queue_execution.admitted",
                 queue_revision=new_revision,
+                operation_uid=operation_uid,
                 queue_execution_uid=queue_execution_uid,
-                payload={"policy": policy.value, "starting_revision": expected_revision},
+                payload={"admission_order": admission_order},
             )
-            for admission_order, row in enumerate(queued):
-                operation_uid = str(row["operation_uid"])
-                await connection.execute(
-                    """
-                    INSERT INTO queue_execution_admissions(
-                        queue_execution_uid, operation_uid, admitted_at,
-                        admission_revision, admission_order
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (queue_execution_uid, operation_uid, timestamp, new_revision, admission_order),
-                )
-                await self._insert_event_on(
-                    connection,
-                    timestamp=timestamp,
-                    actor_kind=ActorKind.PRINCIPAL,
-                    actor_id=principal,
-                    event_type="queue_execution.admitted",
-                    queue_revision=new_revision,
-                    operation_uid=operation_uid,
-                    queue_execution_uid=queue_execution_uid,
-                    payload={"admission_order": admission_order},
-                )
-            record = await self._queue_execution_record_on(connection, queue_execution_uid)
-        return record, new_revision
+        return await self._queue_execution_record_on(connection, queue_execution_uid), new_revision
 
     async def stop_queue_execution(
         self,
@@ -2077,39 +2325,55 @@ class SQLiteStore:
     ) -> tuple[QueueExecutionRecord, int]:
         timestamp = self._timestamp(now)
         await self.expire_control_lease(now=timestamp)
-        async with self.transaction() as connection:
-            self._validate_principal(principal)
-            await self._validate_active_lease_on(connection, principal=principal, timestamp=timestamp)
-            await self._validate_revision_on(connection, expected_revision)
-            row = await self._queue_execution_row_on(connection, queue_execution_uid)
-            if row["state"] != QueueExecutionState.RUNNING.value:
-                raise StateConflictError(f"queue execution {queue_execution_uid} is not running")
-            new_revision = await self._increment_revision_on(connection)
-            await connection.execute(
-                """
-                UPDATE queue_executions
-                SET state=?, stop_requested_at=?, updated_at=?
-                WHERE queue_execution_uid=?
-                """,
-                (QueueExecutionState.STOPPING.value, timestamp, timestamp, queue_execution_uid),
-            )
-            await self._insert_event_on(
+        async with self._transaction() as connection:
+            return await self._stop_queue_execution_on(
                 connection,
-                timestamp=timestamp,
-                actor_kind=ActorKind.PRINCIPAL,
-                actor_id=principal,
-                event_type="queue_execution.stop_requested",
-                queue_revision=new_revision,
+                principal=principal,
+                expected_revision=expected_revision,
                 queue_execution_uid=queue_execution_uid,
-                payload={},
-            )
-            await self._maybe_finish_execution_on(
-                connection,
                 timestamp=timestamp,
-                queue_revision=new_revision,
             )
-            record = await self._queue_execution_record_on(connection, queue_execution_uid)
-        return record, new_revision
+
+    async def _stop_queue_execution_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        principal: str,
+        expected_revision: int,
+        queue_execution_uid: str,
+        timestamp: int,
+    ) -> tuple[QueueExecutionRecord, int]:
+        self._validate_principal(principal)
+        await self._validate_active_lease_on(connection, principal=principal, timestamp=timestamp)
+        await self._validate_revision_on(connection, expected_revision)
+        row = await self._queue_execution_row_on(connection, queue_execution_uid)
+        if row["state"] != QueueExecutionState.RUNNING.value:
+            raise StateConflictError(f"queue execution {queue_execution_uid} is not running")
+        new_revision = await self._increment_revision_on(connection)
+        await connection.execute(
+            """
+            UPDATE queue_executions
+            SET state=?, stop_requested_at=?, updated_at=?
+            WHERE queue_execution_uid=?
+            """,
+            (QueueExecutionState.STOPPING.value, timestamp, timestamp, queue_execution_uid),
+        )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.PRINCIPAL,
+            actor_id=principal,
+            event_type="queue_execution.stop_requested",
+            queue_revision=new_revision,
+            queue_execution_uid=queue_execution_uid,
+            payload={},
+        )
+        await self._maybe_finish_execution_on(
+            connection,
+            timestamp=timestamp,
+            queue_revision=new_revision,
+        )
+        return await self._queue_execution_record_on(connection, queue_execution_uid), new_revision
 
     async def _admit_if_running_on(
         self,
@@ -2271,11 +2535,20 @@ class SQLiteStore:
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("event limit must be between 1 and 1000")
         async with self._transaction_lock:
-            rows = await self._fetchall_on(
-                self._require_connection(),
-                "SELECT * FROM controller_events WHERE event_id>? ORDER BY event_id LIMIT ?",
-                (after, limit),
-            )
+            return await self._events_on(self._require_connection(), after=after, limit=limit)
+
+    async def _events_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        after: int = 0,
+        limit: int = 100,
+    ) -> tuple[ControllerEvent, ...]:
+        rows = await self._fetchall_on(
+            connection,
+            "SELECT * FROM controller_events WHERE event_id>? ORDER BY event_id LIMIT ?",
+            (after, limit),
+        )
         return tuple(self._row_to_event(row) for row in rows)
 
     async def wait_for_events(
@@ -2316,11 +2589,14 @@ class SQLiteStore:
 
     async def get_active_attempt(self) -> AttemptRecord | None:
         async with self._transaction_lock:
-            rows = await self._fetchall_on(
-                self._require_connection(),
-                "SELECT * FROM execution_attempts WHERE state IN ('claimed', 'running')",
-            )
-            return None if not rows else self._row_to_attempt(rows[0])
+            return await self._active_attempt_on(self._require_connection())
+
+    async def _active_attempt_on(self, connection: aiosqlite.Connection) -> AttemptRecord | None:
+        rows = await self._fetchall_on(
+            connection,
+            "SELECT * FROM execution_attempts WHERE state IN ('claimed', 'running')",
+        )
+        return None if not rows else self._row_to_attempt(rows[0])
 
     async def mark_controller_shutdown_requested(
         self,
@@ -2329,46 +2605,59 @@ class SQLiteStore:
         now: int | None = None,
     ) -> int:
         timestamp = self._timestamp(now)
-        async with self.transaction() as connection:
-            attempt = await self._attempt_row_on(connection, attempt_uid)
-            if attempt["state"] not in {AttemptState.CLAIMED.value, AttemptState.RUNNING.value}:
-                raise StateConflictError(f"attempt {attempt_uid} is already terminal")
-            execution = await self._queue_execution_row_on(connection, str(attempt["queue_execution_uid"]))
-            if execution["state"] not in {
-                QueueExecutionState.RUNNING.value,
-                QueueExecutionState.STOPPING.value,
-            }:
-                raise StateConflictError("active attempt has no stoppable queue execution")
-            new_revision = await self._increment_revision_on(connection)
-            await connection.execute(
-                """
-                UPDATE queue_executions
-                SET state='stopping', stop_requested_at=COALESCE(stop_requested_at, ?), updated_at=?
-                WHERE queue_execution_uid=?
-                """,
-                (timestamp, timestamp, attempt["queue_execution_uid"]),
-            )
-            await connection.execute(
-                """
-                UPDATE execution_attempts
-                SET stop_requested_at=COALESCE(stop_requested_at, ?)
-                WHERE attempt_uid=?
-                """,
-                (timestamp, attempt_uid),
-            )
-            await self._insert_event_on(
+        async with self._transaction() as connection:
+            return await self._mark_controller_shutdown_requested_on(
                 connection,
-                timestamp=timestamp,
-                actor_kind=ActorKind.SYSTEM,
-                actor_id="controller",
-                event_type="controller.shutdown_requested",
-                queue_revision=new_revision,
-                operation_uid=str(attempt["operation_uid"]),
-                queue_execution_uid=str(attempt["queue_execution_uid"]),
                 attempt_uid=attempt_uid,
-                worker_instance_uid=str(attempt["worker_instance_uid"]),
-                payload={},
+                timestamp=timestamp,
             )
+
+    async def _mark_controller_shutdown_requested_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        attempt_uid: str,
+        timestamp: int,
+    ) -> int:
+        attempt = await self._attempt_row_on(connection, attempt_uid)
+        if attempt["state"] not in {AttemptState.CLAIMED.value, AttemptState.RUNNING.value}:
+            raise StateConflictError(f"attempt {attempt_uid} is already terminal")
+        execution = await self._queue_execution_row_on(connection, str(attempt["queue_execution_uid"]))
+        if execution["state"] not in {
+            QueueExecutionState.RUNNING.value,
+            QueueExecutionState.STOPPING.value,
+        }:
+            raise StateConflictError("active attempt has no stoppable queue execution")
+        new_revision = await self._increment_revision_on(connection)
+        await connection.execute(
+            """
+            UPDATE queue_executions
+            SET state='stopping', stop_requested_at=COALESCE(stop_requested_at, ?), updated_at=?
+            WHERE queue_execution_uid=?
+            """,
+            (timestamp, timestamp, attempt["queue_execution_uid"]),
+        )
+        await connection.execute(
+            """
+            UPDATE execution_attempts
+            SET stop_requested_at=COALESCE(stop_requested_at, ?)
+            WHERE attempt_uid=?
+            """,
+            (timestamp, attempt_uid),
+        )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.SYSTEM,
+            actor_id="controller",
+            event_type="controller.shutdown_requested",
+            queue_revision=new_revision,
+            operation_uid=str(attempt["operation_uid"]),
+            queue_execution_uid=str(attempt["queue_execution_uid"]),
+            attempt_uid=attempt_uid,
+            worker_instance_uid=str(attempt["worker_instance_uid"]),
+            payload={},
+        )
         return new_revision
 
     async def request_attempt_stop(
@@ -2381,84 +2670,98 @@ class SQLiteStore:
     ) -> StopRequestRecord:
         timestamp = self._timestamp(now)
         await self.expire_control_lease(now=timestamp)
-        async with self.transaction() as connection:
-            self._validate_principal(principal)
-            await self._validate_active_lease_on(connection, principal=principal, timestamp=timestamp)
-            await self._validate_revision_on(connection, expected_revision)
-            attempt = await self._attempt_row_on(connection, attempt_uid)
-            if attempt["state"] not in {AttemptState.CLAIMED.value, AttemptState.RUNNING.value}:
-                raise StateConflictError(f"attempt {attempt_uid} is already terminal")
-            execution = await self._queue_execution_row_on(connection, str(attempt["queue_execution_uid"]))
-            if execution["state"] not in {
-                QueueExecutionState.RUNNING.value,
-                QueueExecutionState.STOPPING.value,
-            }:
-                raise StateConflictError(
-                    f"queue execution {attempt['queue_execution_uid']} cannot accept a safe stop"
-                )
-            if attempt["stop_requested_at"] is not None:
-                raise StateConflictError(f"safe stop was already requested for attempt {attempt_uid}")
-            new_revision = await self._increment_revision_on(connection)
+        async with self._transaction() as connection:
+            return await self._request_attempt_stop_on(
+                connection,
+                principal=principal,
+                expected_revision=expected_revision,
+                attempt_uid=attempt_uid,
+                timestamp=timestamp,
+            )
+
+    async def _request_attempt_stop_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        principal: str,
+        expected_revision: int,
+        attempt_uid: str,
+        timestamp: int,
+    ) -> StopRequestRecord:
+        self._validate_principal(principal)
+        await self._validate_active_lease_on(connection, principal=principal, timestamp=timestamp)
+        await self._validate_revision_on(connection, expected_revision)
+        attempt = await self._attempt_row_on(connection, attempt_uid)
+        if attempt["state"] not in {AttemptState.CLAIMED.value, AttemptState.RUNNING.value}:
+            raise StateConflictError(f"attempt {attempt_uid} is already terminal")
+        execution = await self._queue_execution_row_on(connection, str(attempt["queue_execution_uid"]))
+        if execution["state"] not in {
+            QueueExecutionState.RUNNING.value,
+            QueueExecutionState.STOPPING.value,
+        }:
+            raise StateConflictError(f"queue execution {attempt['queue_execution_uid']} cannot accept a safe stop")
+        if attempt["stop_requested_at"] is not None:
+            raise StateConflictError(f"safe stop was already requested for attempt {attempt_uid}")
+        new_revision = await self._increment_revision_on(connection)
+        await connection.execute(
+            """
+            UPDATE queue_executions
+            SET state='stopping', stop_requested_at=COALESCE(stop_requested_at, ?), updated_at=?
+            WHERE queue_execution_uid=?
+            """,
+            (timestamp, timestamp, attempt["queue_execution_uid"]),
+        )
+        await connection.execute(
+            "UPDATE execution_attempts SET stop_requested_at=? WHERE attempt_uid=?",
+            (timestamp, attempt_uid),
+        )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.PRINCIPAL,
+            actor_id=principal,
+            event_type="attempt.stop_requested",
+            queue_revision=new_revision,
+            operation_uid=str(attempt["operation_uid"]),
+            queue_execution_uid=str(attempt["queue_execution_uid"]),
+            attempt_uid=attempt_uid,
+            worker_instance_uid=str(attempt["worker_instance_uid"]),
+            payload={},
+        )
+        contact_worker = attempt["state"] == AttemptState.RUNNING.value
+        if not contact_worker:
             await connection.execute(
                 """
-                UPDATE queue_executions
-                SET state='stopping', stop_requested_at=COALESCE(stop_requested_at, ?), updated_at=?
-                WHERE queue_execution_uid=?
+                UPDATE execution_attempts
+                SET state='aborted', completed_at=?, cleanup_completed=1
+                WHERE attempt_uid=?
                 """,
-                (timestamp, timestamp, attempt["queue_execution_uid"]),
+                (timestamp, attempt_uid),
             )
             await connection.execute(
-                "UPDATE execution_attempts SET stop_requested_at=? WHERE attempt_uid=?",
-                (timestamp, attempt_uid),
+                "UPDATE operations SET state='aborted', updated_at=? WHERE operation_uid=?",
+                (timestamp, attempt["operation_uid"]),
             )
             await self._insert_event_on(
                 connection,
                 timestamp=timestamp,
                 actor_kind=ActorKind.PRINCIPAL,
                 actor_id=principal,
-                event_type="attempt.stop_requested",
+                event_type="operation.aborted",
                 queue_revision=new_revision,
                 operation_uid=str(attempt["operation_uid"]),
                 queue_execution_uid=str(attempt["queue_execution_uid"]),
                 attempt_uid=attempt_uid,
                 worker_instance_uid=str(attempt["worker_instance_uid"]),
-                payload={},
+                payload={"before_worker_contact": True, "run_uids": []},
             )
-            contact_worker = attempt["state"] == AttemptState.RUNNING.value
-            if not contact_worker:
-                await connection.execute(
-                    """
-                    UPDATE execution_attempts
-                    SET state='aborted', completed_at=?, cleanup_completed=1
-                    WHERE attempt_uid=?
-                    """,
-                    (timestamp, attempt_uid),
-                )
-                await connection.execute(
-                    "UPDATE operations SET state='aborted', updated_at=? WHERE operation_uid=?",
-                    (timestamp, attempt["operation_uid"]),
-                )
-                await self._insert_event_on(
-                    connection,
-                    timestamp=timestamp,
-                    actor_kind=ActorKind.PRINCIPAL,
-                    actor_id=principal,
-                    event_type="operation.aborted",
-                    queue_revision=new_revision,
-                    operation_uid=str(attempt["operation_uid"]),
-                    queue_execution_uid=str(attempt["queue_execution_uid"]),
-                    attempt_uid=attempt_uid,
-                    worker_instance_uid=str(attempt["worker_instance_uid"]),
-                    payload={"before_worker_contact": True, "run_uids": []},
-                )
-                await self._maybe_finish_execution_on(
-                    connection,
-                    timestamp=timestamp,
-                    queue_revision=new_revision,
-                )
-            updated = await self._attempt_row_on(connection, attempt_uid)
+            await self._maybe_finish_execution_on(
+                connection,
+                timestamp=timestamp,
+                queue_revision=new_revision,
+            )
         return StopRequestRecord(
-            attempt=self._row_to_attempt(updated),
+            attempt=await self._attempt_record_on(connection, attempt_uid),
             queue_revision=new_revision,
             contact_worker=contact_worker,
         )
@@ -2470,32 +2773,44 @@ class SQLiteStore:
         now: int | None = None,
     ) -> tuple[AttemptRecord, int]:
         timestamp = self._timestamp(now)
-        async with self.transaction() as connection:
-            attempt = await self._attempt_row_on(connection, attempt_uid)
-            if attempt["state"] != AttemptState.RUNNING.value or attempt["stop_requested_at"] is None:
-                raise StateConflictError(f"attempt {attempt_uid} has no active safe-stop request")
-            if attempt["stop_acknowledged_at"] is not None:
-                raise StateConflictError(f"safe stop was already acknowledged for attempt {attempt_uid}")
-            new_revision = await self._increment_revision_on(connection)
-            await connection.execute(
-                "UPDATE execution_attempts SET stop_acknowledged_at=? WHERE attempt_uid=?",
-                (timestamp, attempt_uid),
-            )
-            await self._insert_event_on(
+        async with self._transaction() as connection:
+            return await self._acknowledge_attempt_stop_on(
                 connection,
-                timestamp=timestamp,
-                actor_kind=ActorKind.SCHEDULER,
-                actor_id=str(attempt["scheduler_authorization"]),
-                event_type="attempt.stop_acknowledged",
-                queue_revision=new_revision,
-                operation_uid=str(attempt["operation_uid"]),
-                queue_execution_uid=str(attempt["queue_execution_uid"]),
                 attempt_uid=attempt_uid,
-                worker_instance_uid=str(attempt["worker_instance_uid"]),
-                payload={},
+                timestamp=timestamp,
             )
-            updated = await self._attempt_row_on(connection, attempt_uid)
-        return self._row_to_attempt(updated), new_revision
+
+    async def _acknowledge_attempt_stop_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        attempt_uid: str,
+        timestamp: int,
+    ) -> tuple[AttemptRecord, int]:
+        attempt = await self._attempt_row_on(connection, attempt_uid)
+        if attempt["state"] != AttemptState.RUNNING.value or attempt["stop_requested_at"] is None:
+            raise StateConflictError(f"attempt {attempt_uid} has no active safe-stop request")
+        if attempt["stop_acknowledged_at"] is not None:
+            raise StateConflictError(f"safe stop was already acknowledged for attempt {attempt_uid}")
+        new_revision = await self._increment_revision_on(connection)
+        await connection.execute(
+            "UPDATE execution_attempts SET stop_acknowledged_at=? WHERE attempt_uid=?",
+            (timestamp, attempt_uid),
+        )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.SCHEDULER,
+            actor_id=str(attempt["scheduler_authorization"]),
+            event_type="attempt.stop_acknowledged",
+            queue_revision=new_revision,
+            operation_uid=str(attempt["operation_uid"]),
+            queue_execution_uid=str(attempt["queue_execution_uid"]),
+            attempt_uid=attempt_uid,
+            worker_instance_uid=str(attempt["worker_instance_uid"]),
+            payload={},
+        )
+        return await self._attempt_record_on(connection, attempt_uid), new_revision
 
     async def claim_next_attempt(
         self,
@@ -2504,95 +2819,110 @@ class SQLiteStore:
         now: int | None = None,
     ) -> DispatchRecord | None:
         timestamp = self._timestamp(now)
-        async with self.transaction() as connection:
-            metadata = await self._fetchone_on(
+        attempt_uid = str(uuid4())
+        execute_message_uid = str(uuid4())
+        async with self._transaction() as connection:
+            return await self._claim_next_attempt_on(
                 connection,
-                "SELECT active_dispatch_block_uid FROM controller_metadata WHERE singleton=1",
-            )
-            if metadata["active_dispatch_block_uid"] is not None:
-                return None
-            worker = await self._worker_instance_row_on(connection, worker_instance_uid)
-            if worker["state"] != "ready":
-                raise StateConflictError(f"worker instance {worker_instance_uid} is not ready")
-            active_attempt = await self._fetchall_on(
-                connection,
-                "SELECT attempt_uid FROM execution_attempts WHERE state IN ('claimed', 'running')",
-            )
-            if active_attempt:
-                return None
-            executions = await self._fetchall_on(
-                connection,
-                "SELECT queue_execution_uid FROM queue_executions WHERE state='running'",
-            )
-            if not executions:
-                return None
-            queue_execution_uid = str(executions[0]["queue_execution_uid"])
-            operations = await self._fetchall_on(
-                connection,
-                """
-                SELECT operations.*, queue_entries.position AS queue_position
-                FROM queue_entries
-                JOIN operations USING(operation_uid)
-                JOIN queue_execution_admissions AS admissions USING(operation_uid)
-                WHERE admissions.queue_execution_uid=? AND operations.state='queued'
-                ORDER BY queue_entries.position
-                LIMIT 1
-                """,
-                (queue_execution_uid,),
-            )
-            if not operations:
-                return None
-            operation_row = operations[0]
-            operation_uid = str(operation_row["operation_uid"])
-            attempt_uid = str(uuid4())
-            execute_message_uid = str(uuid4())
-            scheduler_authorization = f"queue-execution:{queue_execution_uid}"
-            new_revision = await self._increment_revision_on(connection)
-            await connection.execute("DELETE FROM queue_entries WHERE operation_uid=?", (operation_uid,))
-            await self._compact_queue_positions_on(connection)
-            await connection.execute(
-                "UPDATE operations SET state=?, updated_at=? WHERE operation_uid=?",
-                (OperationState.CLAIMED.value, timestamp, operation_uid),
-            )
-            await connection.execute(
-                """
-                INSERT INTO execution_attempts(
-                    attempt_uid, operation_uid, queue_execution_uid, worker_instance_uid,
-                    worker_revision, worker_provenance_json, execute_message_uid,
-                    scheduler_authorization, state, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    attempt_uid,
-                    operation_uid,
-                    queue_execution_uid,
-                    worker_instance_uid,
-                    str(worker["worker_revision"]),
-                    str(worker["worker_provenance_json"]),
-                    execute_message_uid,
-                    scheduler_authorization,
-                    AttemptState.CLAIMED.value,
-                    timestamp,
-                ),
-            )
-            await self._insert_event_on(
-                connection,
-                timestamp=timestamp,
-                actor_kind=ActorKind.SCHEDULER,
-                actor_id=scheduler_authorization,
-                event_type="operation.claimed",
-                queue_revision=new_revision,
-                operation_uid=operation_uid,
-                queue_execution_uid=queue_execution_uid,
-                attempt_uid=attempt_uid,
                 worker_instance_uid=worker_instance_uid,
-                payload={"execute_message_uid": execute_message_uid},
+                timestamp=timestamp,
+                attempt_uid=attempt_uid,
+                execute_message_uid=execute_message_uid,
             )
-            attempt_row = await self._attempt_row_on(connection, attempt_uid)
-            operation_row = await self._operation_row_on(connection, operation_uid)
+
+    async def _claim_next_attempt_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        worker_instance_uid: str,
+        timestamp: int,
+        attempt_uid: str,
+        execute_message_uid: str,
+    ) -> DispatchRecord | None:
+        metadata = await self._fetchone_on(
+            connection,
+            "SELECT active_dispatch_block_uid FROM controller_metadata WHERE singleton=1",
+        )
+        if metadata["active_dispatch_block_uid"] is not None:
+            return None
+        worker = await self._worker_instance_row_on(connection, worker_instance_uid)
+        if worker["state"] != "ready":
+            raise StateConflictError(f"worker instance {worker_instance_uid} is not ready")
+        active_attempt = await self._fetchall_on(
+            connection,
+            "SELECT attempt_uid FROM execution_attempts WHERE state IN ('claimed', 'running')",
+        )
+        if active_attempt:
+            return None
+        executions = await self._fetchall_on(
+            connection,
+            "SELECT queue_execution_uid FROM queue_executions WHERE state='running'",
+        )
+        if not executions:
+            return None
+        queue_execution_uid = str(executions[0]["queue_execution_uid"])
+        operations = await self._fetchall_on(
+            connection,
+            """
+            SELECT operations.*, queue_entries.position AS queue_position
+            FROM queue_entries
+            JOIN operations USING(operation_uid)
+            JOIN queue_execution_admissions AS admissions USING(operation_uid)
+            WHERE admissions.queue_execution_uid=? AND operations.state='queued'
+            ORDER BY queue_entries.position
+            LIMIT 1
+            """,
+            (queue_execution_uid,),
+        )
+        if not operations:
+            return None
+        operation_row = operations[0]
+        operation_uid = str(operation_row["operation_uid"])
+        scheduler_authorization = f"queue-execution:{queue_execution_uid}"
+        new_revision = await self._increment_revision_on(connection)
+        await connection.execute("DELETE FROM queue_entries WHERE operation_uid=?", (operation_uid,))
+        await self._compact_queue_positions_on(connection)
+        await connection.execute(
+            "UPDATE operations SET state=?, updated_at=? WHERE operation_uid=?",
+            (OperationState.CLAIMED.value, timestamp, operation_uid),
+        )
+        await connection.execute(
+            """
+            INSERT INTO execution_attempts(
+                attempt_uid, operation_uid, queue_execution_uid, worker_instance_uid,
+                worker_revision, worker_provenance_json, execute_message_uid,
+                scheduler_authorization, state, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                attempt_uid,
+                operation_uid,
+                queue_execution_uid,
+                worker_instance_uid,
+                str(worker["worker_revision"]),
+                str(worker["worker_provenance_json"]),
+                execute_message_uid,
+                scheduler_authorization,
+                AttemptState.CLAIMED.value,
+                timestamp,
+            ),
+        )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.SCHEDULER,
+            actor_id=scheduler_authorization,
+            event_type="operation.claimed",
+            queue_revision=new_revision,
+            operation_uid=operation_uid,
+            queue_execution_uid=queue_execution_uid,
+            attempt_uid=attempt_uid,
+            worker_instance_uid=worker_instance_uid,
+            payload={"execute_message_uid": execute_message_uid},
+        )
         return DispatchRecord(
-            attempt=self._row_to_attempt(attempt_row),
-            operation=self._row_to_operation(operation_row),
+            attempt=await self._attempt_record_on(connection, attempt_uid),
+            operation=await self._operation_record_on(connection, operation_uid),
         )
 
     async def mark_attempt_running(
@@ -2602,34 +2932,46 @@ class SQLiteStore:
         now: int | None = None,
     ) -> AttemptRecord:
         timestamp = self._timestamp(now)
-        async with self.transaction() as connection:
-            row = await self._attempt_row_on(connection, attempt_uid)
-            if row["state"] != AttemptState.CLAIMED.value:
-                raise StateConflictError(f"attempt {attempt_uid} is not claimed")
-            new_revision = await self._increment_revision_on(connection)
-            await connection.execute(
-                "UPDATE execution_attempts SET state=?, started_at=? WHERE attempt_uid=?",
-                (AttemptState.RUNNING.value, timestamp, attempt_uid),
-            )
-            await connection.execute(
-                "UPDATE operations SET state=?, updated_at=? WHERE operation_uid=?",
-                (OperationState.RUNNING.value, timestamp, row["operation_uid"]),
-            )
-            await self._insert_event_on(
+        async with self._transaction() as connection:
+            return await self._mark_attempt_running_on(
                 connection,
-                timestamp=timestamp,
-                actor_kind=ActorKind.SCHEDULER,
-                actor_id=str(row["scheduler_authorization"]),
-                event_type="operation.running",
-                queue_revision=new_revision,
-                operation_uid=str(row["operation_uid"]),
-                queue_execution_uid=str(row["queue_execution_uid"]),
                 attempt_uid=attempt_uid,
-                worker_instance_uid=str(row["worker_instance_uid"]),
-                payload={},
+                timestamp=timestamp,
             )
-            updated = await self._attempt_row_on(connection, attempt_uid)
-        return self._row_to_attempt(updated)
+
+    async def _mark_attempt_running_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        attempt_uid: str,
+        timestamp: int,
+    ) -> AttemptRecord:
+        row = await self._attempt_row_on(connection, attempt_uid)
+        if row["state"] != AttemptState.CLAIMED.value:
+            raise StateConflictError(f"attempt {attempt_uid} is not claimed")
+        new_revision = await self._increment_revision_on(connection)
+        await connection.execute(
+            "UPDATE execution_attempts SET state=?, started_at=? WHERE attempt_uid=?",
+            (AttemptState.RUNNING.value, timestamp, attempt_uid),
+        )
+        await connection.execute(
+            "UPDATE operations SET state=?, updated_at=? WHERE operation_uid=?",
+            (OperationState.RUNNING.value, timestamp, row["operation_uid"]),
+        )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.SCHEDULER,
+            actor_id=str(row["scheduler_authorization"]),
+            event_type="operation.running",
+            queue_revision=new_revision,
+            operation_uid=str(row["operation_uid"]),
+            queue_execution_uid=str(row["queue_execution_uid"]),
+            attempt_uid=attempt_uid,
+            worker_instance_uid=str(row["worker_instance_uid"]),
+            payload={},
+        )
+        return await self._attempt_record_on(connection, attempt_uid)
 
     async def complete_attempt(
         self,
@@ -2643,6 +2985,33 @@ class SQLiteStore:
         fence_evidence: Mapping[str, object] | None = None,
         now: int | None = None,
     ) -> AttemptRecord:
+        timestamp = self._timestamp(now)
+        async with self._transaction() as connection:
+            return await self._complete_attempt_on(
+                connection,
+                attempt_uid=attempt_uid,
+                state=state,
+                result=result,
+                run_uids=run_uids,
+                diagnostic=diagnostic,
+                cleanup_completed=cleanup_completed,
+                fence_evidence=fence_evidence,
+                timestamp=timestamp,
+            )
+
+    async def _complete_attempt_on(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        attempt_uid: str,
+        state: AttemptState,
+        result: Mapping[str, object] | None,
+        run_uids: tuple[str, ...],
+        diagnostic: str | None,
+        cleanup_completed: bool,
+        fence_evidence: Mapping[str, object] | None,
+        timestamp: int,
+    ) -> AttemptRecord:
         if state not in {
             AttemptState.SUCCEEDED,
             AttemptState.FAILED,
@@ -2655,95 +3024,108 @@ class SQLiteStore:
             raise ValueError("run_uids must contain nonempty strings")
         result_json = None if result is None else canonical_json(dict(result))
         run_uids_json = canonical_json(list(run_uids))
-        timestamp = self._timestamp(now)
-        async with self.transaction() as connection:
-            row = await self._attempt_row_on(connection, attempt_uid)
-            if row["state"] not in {AttemptState.CLAIMED.value, AttemptState.RUNNING.value}:
-                raise StateConflictError(f"attempt {attempt_uid} is already terminal")
-            new_revision = await self._increment_revision_on(connection)
-            await connection.execute(
-                """
-                UPDATE execution_attempts
-                SET state=?, completed_at=?, result_json=?, run_uids_json=?,
-                    diagnostic=?, cleanup_completed=?
-                WHERE attempt_uid=?
-                """,
-                (
-                    state.value,
-                    timestamp,
-                    result_json,
-                    run_uids_json,
-                    diagnostic,
-                    int(cleanup_completed),
-                    attempt_uid,
-                ),
+        row = await self._attempt_row_on(connection, attempt_uid)
+        if row["state"] not in {AttemptState.CLAIMED.value, AttemptState.RUNNING.value}:
+            raise StateConflictError(f"attempt {attempt_uid} is already terminal")
+        new_revision = await self._increment_revision_on(connection)
+        await connection.execute(
+            """
+            UPDATE execution_attempts
+            SET state=?, completed_at=?, result_json=?, run_uids_json=?,
+                diagnostic=?, cleanup_completed=?
+            WHERE attempt_uid=?
+            """,
+            (
+                state.value,
+                timestamp,
+                result_json,
+                run_uids_json,
+                diagnostic,
+                int(cleanup_completed),
+                attempt_uid,
+            ),
+        )
+        await connection.execute(
+            "UPDATE operations SET state=?, result_json=?, updated_at=? WHERE operation_uid=?",
+            (state.value, result_json, timestamp, row["operation_uid"]),
+        )
+        await self._insert_event_on(
+            connection,
+            timestamp=timestamp,
+            actor_kind=ActorKind.SCHEDULER,
+            actor_id=str(row["scheduler_authorization"]),
+            event_type=f"operation.{state.value}",
+            queue_revision=new_revision,
+            operation_uid=str(row["operation_uid"]),
+            queue_execution_uid=str(row["queue_execution_uid"]),
+            attempt_uid=attempt_uid,
+            worker_instance_uid=str(row["worker_instance_uid"]),
+            payload={
+                "run_uids": list(run_uids),
+                "diagnostic": diagnostic,
+                "cleanup_completed": cleanup_completed,
+            },
+        )
+        if state in {AttemptState.FAILED, AttemptState.INTERRUPTED, AttemptState.UNKNOWN}:
+            await self._block_dispatch_on(
+                connection,
+                attempt_row=row,
+                kind=state.value,
+                reason=diagnostic or f"attempt ended {state.value}",
+                requires_fence=state in {AttemptState.INTERRUPTED, AttemptState.UNKNOWN},
+                timestamp=timestamp,
+                queue_revision=new_revision,
+                fence_evidence=fence_evidence,
             )
-            await connection.execute(
-                "UPDATE operations SET state=?, result_json=?, updated_at=? WHERE operation_uid=?",
-                (state.value, result_json, timestamp, row["operation_uid"]),
-            )
-            await self._insert_event_on(
+        else:
+            if state is AttemptState.ABORTED:
+                await connection.execute(
+                    """
+                    UPDATE queue_executions
+                    SET state='stopping', stop_requested_at=COALESCE(stop_requested_at, ?), updated_at=?
+                    WHERE queue_execution_uid=? AND state='running'
+                    """,
+                    (timestamp, timestamp, row["queue_execution_uid"]),
+                )
+            await self._maybe_finish_execution_on(
                 connection,
                 timestamp=timestamp,
-                actor_kind=ActorKind.SCHEDULER,
-                actor_id=str(row["scheduler_authorization"]),
-                event_type=f"operation.{state.value}",
                 queue_revision=new_revision,
-                operation_uid=str(row["operation_uid"]),
-                queue_execution_uid=str(row["queue_execution_uid"]),
-                attempt_uid=attempt_uid,
-                worker_instance_uid=str(row["worker_instance_uid"]),
-                payload={
-                    "run_uids": list(run_uids),
-                    "diagnostic": diagnostic,
-                    "cleanup_completed": cleanup_completed,
-                },
             )
-            if state in {AttemptState.FAILED, AttemptState.INTERRUPTED, AttemptState.UNKNOWN}:
-                await self._block_dispatch_on(
-                    connection,
-                    attempt_row=row,
-                    kind=state.value,
-                    reason=diagnostic or f"attempt ended {state.value}",
-                    requires_fence=state in {AttemptState.INTERRUPTED, AttemptState.UNKNOWN},
-                    timestamp=timestamp,
-                    queue_revision=new_revision,
-                    fence_evidence=fence_evidence,
-                )
-            else:
-                if state is AttemptState.ABORTED:
-                    await connection.execute(
-                        """
-                        UPDATE queue_executions
-                        SET state='stopping', stop_requested_at=COALESCE(stop_requested_at, ?), updated_at=?
-                        WHERE queue_execution_uid=? AND state='running'
-                        """,
-                        (timestamp, timestamp, row["queue_execution_uid"]),
-                    )
-                await self._maybe_finish_execution_on(
-                    connection,
-                    timestamp=timestamp,
-                    queue_revision=new_revision,
-                )
-            updated = await self._attempt_row_on(connection, attempt_uid)
-        return self._row_to_attempt(updated)
+        return await self._attempt_record_on(connection, attempt_uid)
 
     async def get_attempt(self, attempt_uid: str) -> AttemptRecord:
         async with self._transaction_lock:
-            row = await self._attempt_row_on(self._require_connection(), attempt_uid)
-            return self._row_to_attempt(row)
+            return await self._attempt_record_on(self._require_connection(), attempt_uid)
+
+    async def _attempt_record_on(
+        self,
+        connection: aiosqlite.Connection,
+        attempt_uid: str,
+    ) -> AttemptRecord:
+        return self._row_to_attempt(await self._attempt_row_on(connection, attempt_uid))
 
     async def get_latest_attempt_for_operation(self, operation_uid: str) -> AttemptRecord | None:
         async with self._transaction_lock:
-            rows = await self._fetchall_on(
+            return await self._latest_attempt_for_operation_on(
                 self._require_connection(),
-                """
-                SELECT * FROM execution_attempts
-                WHERE operation_uid=? ORDER BY created_at DESC, rowid DESC LIMIT 1
-                """,
-                (operation_uid,),
+                operation_uid,
             )
-            return None if not rows else self._row_to_attempt(rows[0])
+
+    async def _latest_attempt_for_operation_on(
+        self,
+        connection: aiosqlite.Connection,
+        operation_uid: str,
+    ) -> AttemptRecord | None:
+        rows = await self._fetchall_on(
+            connection,
+            """
+            SELECT * FROM execution_attempts
+            WHERE operation_uid=? ORDER BY created_at DESC, rowid DESC LIMIT 1
+            """,
+            (operation_uid,),
+        )
+        return None if not rows else self._row_to_attempt(rows[0])
 
     async def _block_dispatch_on(
         self,
@@ -2867,7 +3249,7 @@ class SQLiteStore:
         now: int | None = None,
     ) -> IdempotencyResult:
         timestamp = self._timestamp(now)
-        async with self.transaction() as connection:
+        async with self._transaction() as connection:
             rows = await self._fetchall_on(
                 connection,
                 """
@@ -3060,30 +3442,26 @@ class SQLiteStore:
         )
 
     @asynccontextmanager
-    async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
-        current = self._transaction_connection.get()
-        if current is not None:
-            yield current
-            return
-
+    async def _transaction(self) -> AsyncIterator[aiosqlite.Connection]:
         notify_events = False
         async with self._transaction_lock:
             connection = self._require_connection()
-            token = self._transaction_connection.set(connection)
             self._transaction_has_event = False
             await connection.execute("BEGIN IMMEDIATE")
             try:
                 yield connection
             except BaseException:
                 await connection.rollback()
-                self._transaction_has_event = False
                 raise
             else:
-                await connection.commit()
+                try:
+                    await connection.commit()
+                except BaseException:
+                    await connection.rollback()
+                    raise
                 notify_events = self._transaction_has_event
-                self._transaction_has_event = False
             finally:
-                self._transaction_connection.reset(token)
+                self._transaction_has_event = False
         if notify_events:
             async with self._event_condition:
                 self._event_condition.notify_all()

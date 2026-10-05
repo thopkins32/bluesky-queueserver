@@ -11,8 +11,14 @@ from jwt.algorithms import RSAAlgorithm
 
 from bluesky_queueserver.v2.auth import AuthenticationError, OidcAuthenticator
 from bluesky_queueserver.v2.config import OidcConfig
-from bluesky_queueserver.v2.contracts import SIMULATED_COUNT_DESCRIPTOR, AuthorizationScope, WorkerCatalog
-from bluesky_queueserver.v2.controller import ControllerService
+from bluesky_queueserver.v2.contracts import (
+    SIMULATED_COUNT_DESCRIPTOR,
+    AttemptState,
+    AuthorizationScope,
+    QueueExecutionState,
+    WorkerCatalog,
+)
+from bluesky_queueserver.v2.controller import ControllerService, WorkerCompletion
 from bluesky_queueserver.v2.storage import SQLiteStore
 from bluesky_queueserver.v2.web import create_app
 
@@ -139,6 +145,154 @@ class ApiWorker:
         return 0
 
 
+class SafeStopBarrierWorker(ApiWorker):
+    def __init__(self, lock_path):
+        super().__init__(lock_path)
+        self.execution_started = asyncio.Event()
+        self.safe_stop_requested = asyncio.Event()
+        self.release_safe_stop = asyncio.Event()
+        self.attempt = None
+        self.completion = None
+        self.stop_requests = []
+
+    async def start_execution(self, *, attempt, descriptor, parameters):
+        self.attempt = attempt
+        self.completion = asyncio.get_running_loop().create_future()
+        self.execution_started.set()
+        return self.completion
+
+    async def request_safe_stop(self, *, attempt_uid):
+        assert self.attempt is not None
+        assert attempt_uid == self.attempt.attempt_uid
+        self.stop_requests.append(attempt_uid)
+        self.safe_stop_requested.set()
+        await self.release_safe_stop.wait()
+
+    def finish_safe_stop(self):
+        assert self.completion is not None
+        self.completion.set_result(
+            WorkerCompletion(
+                state=AttemptState.ABORTED,
+                result=None,
+                run_uids=(),
+                diagnostic="safe stop",
+                cleanup_completed=True,
+                stop_acknowledged=True,
+            )
+        )
+
+
+def test_http_safe_stop_replay_contacts_worker_once(tmp_path):
+    async def scenario():
+        private_key, authenticator = make_authenticator(tmp_path)
+        store = SQLiteStore(tmp_path / "state.sqlite", instrument_id="instrument")
+        worker = SafeStopBarrierWorker(store.worker_lock_path)
+        service = ControllerService(store, worker=worker)
+        await service.open()
+        client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=create_app(service, authenticator)),
+            base_url="https://testserver",
+        )
+        try:
+            control_headers = {"Authorization": f"Bearer {token_for(private_key)}"}
+            submission = {
+                "operation_id": "simulated-count",
+                "operation_version": "1",
+                "parameters": {"detectors": ["det"], "num": 1, "delay": 0.0},
+            }
+            lease = await client.post(
+                "/api/v2/control-lease",
+                headers={**control_headers, "Idempotency-Key": "safe-stop-lease"},
+                json={"ttl_seconds": 300},
+            )
+            assert lease.status_code == 201
+
+            operation_uids = []
+            revision = 0
+            for index in (1, 2):
+                submitted = await client.post(
+                    "/api/v2/operations",
+                    headers={
+                        **control_headers,
+                        "Idempotency-Key": f"safe-stop-operation-{index}",
+                        "If-Match": f'"qrev-{revision}"',
+                    },
+                    json={**submission, "parameters": {"detectors": ["det"], "num": index}},
+                )
+                assert submitted.status_code == 201
+                revision += 1
+                operation_uids.append(submitted.json()["operation_uid"])
+
+            started = await client.post(
+                "/api/v2/queue-executions",
+                headers={
+                    **control_headers,
+                    "Idempotency-Key": "safe-stop-execution",
+                    "If-Match": f'"qrev-{revision}"',
+                },
+                json={},
+            )
+            assert started.status_code == 201
+            execution_uid = started.json()["queue_execution_uid"]
+            await asyncio.wait_for(worker.execution_started.wait(), timeout=1)
+            assert worker.attempt is not None
+
+            cursor = 0
+            while True:
+                events = await store.wait_for_events(after=cursor, timeout=1)
+                assert events, "timed out waiting for operation.running"
+                if any(event.event_type == "operation.running" for event in events):
+                    break
+                cursor = events[-1].event_id
+
+            revision = await store.current_revision()
+            safe_stop_headers = {
+                **control_headers,
+                "Idempotency-Key": "safe-stop-attempt",
+                "If-Match": f'"qrev-{revision}"',
+            }
+            safe_stop_task = asyncio.create_task(
+                client.post(
+                    f"/api/v2/attempts/{worker.attempt.attempt_uid}/safe-stop",
+                    headers=safe_stop_headers,
+                )
+            )
+            await asyncio.wait_for(worker.safe_stop_requested.wait(), timeout=1)
+            assert worker.stop_requests == [worker.attempt.attempt_uid]
+            worker.release_safe_stop.set()
+            stopped = await safe_stop_task
+            assert stopped.status_code == 200
+
+            worker.finish_safe_stop()
+            await service.wait_scheduler_idle()
+            terminal = await store.get_attempt(worker.attempt.attempt_uid)
+            execution = await store.get_queue_execution(execution_uid)
+            assert terminal.state is AttemptState.ABORTED
+            assert execution.state is QueueExecutionState.STOPPED
+            assert [item.operation_uid for item in (await store.queue_snapshot()).operations] == [
+                operation_uids[1]
+            ]
+
+            revision_before_replay = await store.current_revision()
+            events_before_replay = await store.list_events()
+            replayed = await client.post(
+                f"/api/v2/attempts/{worker.attempt.attempt_uid}/safe-stop",
+                headers=safe_stop_headers,
+            )
+            assert replayed.status_code == stopped.status_code
+            assert replayed.json() == stopped.json()
+            assert replayed.headers["etag"] == stopped.headers["etag"]
+            assert worker.stop_requests == [worker.attempt.attempt_uid]
+            assert await store.current_revision() == revision_before_replay
+            assert await store.list_events() == events_before_replay
+        finally:
+            await client.aclose()
+            await authenticator.close()
+            await service.close()
+
+    run(scenario())
+
+
 def test_http_api_authentication_etag_idempotency_and_surface(tmp_path):
     async def scenario():
         private_key, authenticator = make_authenticator(tmp_path)
@@ -226,6 +380,7 @@ def test_http_api_authentication_etag_idempotency_and_surface(tmp_path):
             )
             assert second.status_code == 201
             assert second.headers["etag"] == '"qrev-2"'
+            second_uid = second.json()["operation_uid"]
 
             replay = await client.post("/api/v2/operations", headers=submit_headers, json=submission)
             assert replay.status_code == 201
@@ -263,6 +418,56 @@ def test_http_api_authentication_etag_idempotency_and_surface(tmp_path):
             )
             assert actor_injection.status_code == 422
             assert (await client.get("/api/v2/queue", headers=read_headers)).headers["etag"] == '"qrev-2"'
+            reorder_body = {"operation_uids": [second_uid, operation_uid]}
+            reorder_headers = {
+                **control_headers,
+                "Idempotency-Key": "queue-reorder-1",
+                "If-Match": '"qrev-2"',
+            }
+            reordered = await client.post(
+                "/api/v2/queue/reorder",
+                headers=reorder_headers,
+                json=reorder_body,
+            )
+            assert reordered.status_code == 200
+            assert reordered.headers["etag"] == '"qrev-3"'
+            assert [item["operation_uid"] for item in reordered.json()["operations"]] == [
+                second_uid,
+                operation_uid,
+            ]
+
+            third = await client.post(
+                "/api/v2/operations",
+                headers={
+                    **control_headers,
+                    "Idempotency-Key": "operation-3",
+                    "If-Match": '"qrev-3"',
+                },
+                json={**submission, "parameters": {"detectors": ["det"], "num": 3}},
+            )
+            assert third.status_code == 201
+            assert third.headers["etag"] == '"qrev-4"'
+            third_uid = third.json()["operation_uid"]
+            revision_before_replay = await store.current_revision()
+            events_before_replay = await store.list_events()
+
+            replayed_reorder = await client.post(
+                "/api/v2/queue/reorder",
+                headers=reorder_headers,
+                json=reorder_body,
+            )
+            current_queue = await client.get("/api/v2/queue", headers=read_headers)
+            assert replayed_reorder.status_code == reordered.status_code
+            assert replayed_reorder.json() == reordered.json()
+            assert replayed_reorder.headers["etag"] == reordered.headers["etag"]
+            assert await store.current_revision() == revision_before_replay == 4
+            assert await store.list_events() == events_before_replay
+            assert current_queue.headers["etag"] == '"qrev-4"'
+            assert [item["operation_uid"] for item in current_queue.json()["operations"]] == [
+                second_uid,
+                operation_uid,
+                third_uid,
+            ]
 
             specification = await client.get("/api/v2/openapi.json", headers=read_headers)
             assert specification.status_code == 200

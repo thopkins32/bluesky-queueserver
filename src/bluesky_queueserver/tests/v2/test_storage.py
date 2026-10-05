@@ -646,8 +646,12 @@ def test_idempotent_mutation_replays_original_response_after_revision_advances(t
 
 
 def test_invalid_idempotency_response_rolls_back_action(tmp_path):
+    database_path = tmp_path / "state.sqlite"
+
     async def scenario():
-        async with SQLiteStore(tmp_path / "state.sqlite", instrument_id="instrument") as store:
+        async with SQLiteStore(database_path, instrument_id="instrument", clock=lambda: 100) as store:
+            await store.acquire_control_lease(principal="operator")
+            events_before = await store.list_events()
             request = IdempotencyRequest(
                 principal="operator",
                 method="POST",
@@ -658,14 +662,34 @@ def test_invalid_idempotency_response_rolls_back_action(tmp_path):
             )
 
             async def mutate(connection):
-                await store._increment_revision_on(connection)
+                validated = storage.validate_operation_request(
+                    SIMULATED_COUNT_DESCRIPTOR,
+                    operation_id="simulated-count",
+                    operation_version="1",
+                    parameters={"detectors": ["det"]},
+                )
+                await store._submit_operation_on(
+                    connection,
+                    principal="operator",
+                    expected_revision=0,
+                    descriptor=SIMULATED_COUNT_DESCRIPTOR,
+                    parameters_json=storage.canonical_json(validated),
+                    fingerprint=storage.descriptor_fingerprint(SIMULATED_COUNT_DESCRIPTOR),
+                    operation_uid=str(uuid4()),
+                    timestamp=100,
+                )
                 return StoredHttpResponse(status=201, body={"bad": float("nan")}, etag='"qrev-1"')
 
             with pytest.raises(ValueError):
                 await store.run_idempotent_mutation(request, mutate)
-            assert await store.current_revision() == 0
+            assert await store.queue_snapshot() == storage.QueueRecord(revision=0, operations=())
+            assert await store.list_events() == events_before
 
     run(scenario())
+    connection = sqlite3.connect(database_path)
+    assert connection.execute("SELECT COUNT(*) FROM operations").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM idempotency_records").fetchone()[0] == 0
+    connection.close()
 
 
 def test_idempotency_key_format_is_bounded():

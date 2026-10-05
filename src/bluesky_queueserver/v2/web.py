@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import Annotated
 from uuid import uuid4
 
+import aiosqlite
 from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -42,6 +43,7 @@ from .controller import (
 from .storage import (
     IdempotencyConflictError,
     IdempotencyRequest,
+    IdempotencyResult,
     LeaseConflictError,
     LeaseExpiredError,
     LeaseOwnershipError,
@@ -171,18 +173,17 @@ def create_app(
     control_principal = require_scope(AuthorizationScope.CONTROL)
     admin_principal = require_scope(AuthorizationScope.ADMIN)
 
-    async def idempotent(
+    def idempotency_request(
         request: Request,
         principal: Principal,
         *,
         key: str | None,
         if_match: str | None,
         body: object,
-        action: Callable[[], Awaitable[tuple[int, Mapping[str, object], str | None]]],
-    ) -> JSONResponse:
+    ) -> IdempotencyRequest:
         if key is None:
             raise MissingIdempotencyKeyError("Idempotency-Key is required")
-        context = IdempotencyRequest(
+        return IdempotencyRequest(
             principal=principal.subject,
             method=request.method,
             target=request.url.path,
@@ -191,17 +192,46 @@ def create_app(
             if_match=if_match,
         )
 
-        async def invoke(connection):
-            status, response_body, etag = await action()
-            return StoredHttpResponse(status=status, body=response_body, etag=etag)
-
-        result = await service.store.run_idempotent_mutation(context, invoke)
+    def idempotency_response(result: IdempotencyResult) -> JSONResponse:
         headers = {} if result.response.etag is None else {"ETag": result.response.etag}
         return JSONResponse(
             status_code=result.response.status,
             content=dict(result.response.body),
             headers=headers,
         )
+
+    async def wake_scheduler_after_commit() -> None:
+        service.wake_scheduler()
+
+    async def idempotent(
+        request: Request,
+        principal: Principal,
+        *,
+        key: str | None,
+        if_match: str | None,
+        body: object,
+        action: Callable[[aiosqlite.Connection], Awaitable[tuple[int, Mapping[str, object], str | None]]],
+        before_transaction: Callable[[], Awaitable[None]] | None = None,
+        after_commit: Callable[[], Awaitable[None]] | None = None,
+    ) -> JSONResponse:
+        context = idempotency_request(
+            request,
+            principal,
+            key=key,
+            if_match=if_match,
+            body=body,
+        )
+        if before_transaction is not None:
+            await before_transaction()
+
+        async def invoke(connection: aiosqlite.Connection) -> StoredHttpResponse:
+            status, response_body, etag = await action(connection)
+            return StoredHttpResponse(status=status, body=response_body, etag=etag)
+
+        result = await service.store.run_idempotent_mutation(context, invoke)
+        if not result.replayed and after_commit is not None:
+            await after_commit()
+        return idempotency_response(result)
 
     @app.get("/health", response_model=HealthView)
     async def health():
@@ -317,11 +347,15 @@ def create_app(
         principal: Annotated[Principal, Depends(control_principal)],
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ):
-        async def action():
-            view = await service.acquire_control_lease(
+        timestamp = service.store.now_micros()
+
+        async def action(connection: aiosqlite.Connection):
+            view = await service._acquire_control_lease_on(
+                connection,
                 principal=principal.subject,
                 scopes=principal.scopes,
                 ttl_seconds=body.ttl_seconds,
+                timestamp=timestamp,
             )
             return 201, _model_payload(view), None
 
@@ -332,6 +366,7 @@ def create_app(
             if_match=None,
             body=body.model_dump(mode="json"),
             action=action,
+            after_commit=wake_scheduler_after_commit,
         )
 
     @app.post("/api/v2/control-lease/renew", response_model=ControlLeaseView)
@@ -341,16 +376,34 @@ def create_app(
         principal: Annotated[Principal, Depends(control_principal)],
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ):
-        async def action():
-            view = await service.renew_control_lease(
+        timestamp = service.store.now_micros()
+        lease_expired = False
+
+        async def expire_lease():
+            nonlocal lease_expired
+            lease_expired = await service.store.expire_control_lease(now=timestamp)
+
+        async def action(connection: aiosqlite.Connection):
+            if lease_expired:
+                raise LeaseExpiredError("control lease has expired")
+            view = await service._renew_control_lease_on(
+                connection,
                 principal=principal.subject,
                 scopes=principal.scopes,
                 ttl_seconds=body.ttl_seconds,
+                timestamp=timestamp,
             )
             return 200, _model_payload(view), None
 
         return await idempotent(
-            request, principal, key=idempotency_key, if_match=None, body=body.model_dump(), action=action
+            request,
+            principal,
+            key=idempotency_key,
+            if_match=None,
+            body=body.model_dump(),
+            action=action,
+            before_transaction=expire_lease,
+            after_commit=wake_scheduler_after_commit,
         )
 
     @app.post("/api/v2/control-lease/release")
@@ -359,11 +412,34 @@ def create_app(
         principal: Annotated[Principal, Depends(control_principal)],
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ):
-        async def action():
-            await service.release_control_lease(principal=principal.subject, scopes=principal.scopes)
+        timestamp = service.store.now_micros()
+        lease_expired = False
+
+        async def expire_lease():
+            nonlocal lease_expired
+            lease_expired = await service.store.expire_control_lease(now=timestamp)
+
+        async def action(connection: aiosqlite.Connection):
+            if lease_expired:
+                raise LeaseExpiredError("control lease has expired")
+            await service._release_control_lease_on(
+                connection,
+                principal=principal.subject,
+                scopes=principal.scopes,
+                timestamp=timestamp,
+            )
             return 200, {"released": True}, None
 
-        return await idempotent(request, principal, key=idempotency_key, if_match=None, body={}, action=action)
+        return await idempotent(
+            request,
+            principal,
+            key=idempotency_key,
+            if_match=None,
+            body={},
+            action=action,
+            before_transaction=expire_lease,
+            after_commit=wake_scheduler_after_commit,
+        )
 
     @app.post("/api/v2/control-lease/override", response_model=ControlLeaseView)
     async def override_lease(
@@ -372,16 +448,27 @@ def create_app(
         principal: Annotated[Principal, Depends(admin_principal)],
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ):
-        async def action():
-            view = await service.override_control_lease(
+        timestamp = service.store.now_micros()
+
+        async def action(connection: aiosqlite.Connection):
+            view = await service._override_control_lease_on(
+                connection,
                 administrator=principal.subject,
                 scopes=principal.scopes,
                 reason=body.reason,
+                ttl_seconds=300,
+                timestamp=timestamp,
             )
             return 200, _model_payload(view), None
 
         return await idempotent(
-            request, principal, key=idempotency_key, if_match=None, body=body.model_dump(), action=action
+            request,
+            principal,
+            key=idempotency_key,
+            if_match=None,
+            body=body.model_dump(),
+            action=action,
+            after_commit=wake_scheduler_after_commit,
         )
 
     @app.post("/api/v2/operations", response_model=OperationView)
@@ -392,14 +479,21 @@ def create_app(
         if_match: Annotated[str | None, Header(alias="If-Match")] = None,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ):
-        async def action():
-            record, revision = await service.submit_operation(
+        timestamp = service.store.now_micros()
+
+        async def expire_lease():
+            await service.store.expire_control_lease(now=timestamp)
+
+        async def action(connection: aiosqlite.Connection):
+            record, revision = await service._submit_operation_on(
+                connection,
                 principal=principal.subject,
                 scopes=principal.scopes,
                 if_match=if_match,
                 submission=body,
+                timestamp=timestamp,
             )
-            view = await service.operation_view(record.operation_uid)
+            view = await service._operation_view_on(connection, record)
             return 201, _model_payload(view), queue_etag(revision)
 
         return await idempotent(
@@ -409,6 +503,8 @@ def create_app(
             if_match=if_match,
             body=body.model_dump(mode="json"),
             action=action,
+            before_transaction=expire_lease,
+            after_commit=wake_scheduler_after_commit,
         )
 
     @app.delete("/api/v2/operations/{operation_uid}", response_model=OperationView)
@@ -419,17 +515,33 @@ def create_app(
         if_match: Annotated[str | None, Header(alias="If-Match")] = None,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ):
-        async def action():
-            record, revision = await service.cancel_operation(
+        timestamp = service.store.now_micros()
+
+        async def expire_lease():
+            await service.store.expire_control_lease(now=timestamp)
+
+        async def action(connection: aiosqlite.Connection):
+            record, revision = await service._cancel_operation_on(
+                connection,
                 principal=principal.subject,
                 scopes=principal.scopes,
                 if_match=if_match,
                 operation_uid=operation_uid,
+                timestamp=timestamp,
             )
-            view = await service.operation_view(record.operation_uid)
+            view = await service._operation_view_on(connection, record)
             return 200, _model_payload(view), queue_etag(revision)
 
-        return await idempotent(request, principal, key=idempotency_key, if_match=if_match, body={}, action=action)
+        return await idempotent(
+            request,
+            principal,
+            key=idempotency_key,
+            if_match=if_match,
+            body={},
+            action=action,
+            before_transaction=expire_lease,
+            after_commit=wake_scheduler_after_commit,
+        )
 
     @app.put("/api/v2/operations/{operation_uid}", response_model=OperationView)
     async def replace_operation(
@@ -440,15 +552,22 @@ def create_app(
         if_match: Annotated[str | None, Header(alias="If-Match")] = None,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ):
-        async def action():
-            record, revision = await service.replace_operation(
+        timestamp = service.store.now_micros()
+
+        async def expire_lease():
+            await service.store.expire_control_lease(now=timestamp)
+
+        async def action(connection: aiosqlite.Connection):
+            record, revision = await service._replace_operation_on(
+                connection,
                 principal=principal.subject,
                 scopes=principal.scopes,
                 if_match=if_match,
                 operation_uid=operation_uid,
                 submission=body,
+                timestamp=timestamp,
             )
-            view = await service.operation_view(record.operation_uid)
+            view = await service._operation_view_on(connection, record)
             return 200, _model_payload(view), queue_etag(revision)
 
         return await idempotent(
@@ -458,6 +577,8 @@ def create_app(
             if_match=if_match,
             body=body.model_dump(mode="json"),
             action=action,
+            before_transaction=expire_lease,
+            after_commit=wake_scheduler_after_commit,
         )
 
     @app.post("/api/v2/queue/reorder", response_model=QueueSnapshot)
@@ -468,14 +589,21 @@ def create_app(
         if_match: Annotated[str | None, Header(alias="If-Match")] = None,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ):
-        async def action():
-            snapshot = await service.reorder_queue(
+        timestamp = service.store.now_micros()
+
+        async def expire_lease():
+            await service.store.expire_control_lease(now=timestamp)
+
+        async def action(connection: aiosqlite.Connection):
+            snapshot = await service._reorder_queue_on(
+                connection,
                 principal=principal.subject,
                 scopes=principal.scopes,
                 if_match=if_match,
                 reorder=body,
+                timestamp=timestamp,
             )
-            view = await service.queue_view()
+            view = await service._queue_view_on(connection, snapshot)
             return 200, _model_payload(view), queue_etag(snapshot.revision)
 
         return await idempotent(
@@ -485,6 +613,8 @@ def create_app(
             if_match=if_match,
             body=body.model_dump(mode="json"),
             action=action,
+            before_transaction=expire_lease,
+            after_commit=wake_scheduler_after_commit,
         )
 
     @app.post("/api/v2/queue-executions", response_model=QueueExecutionView)
@@ -495,14 +625,21 @@ def create_app(
         if_match: Annotated[str | None, Header(alias="If-Match")] = None,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ):
-        async def action():
-            record, revision = await service.start_queue_execution(
+        timestamp = service.store.now_micros()
+
+        async def expire_lease():
+            await service.store.expire_control_lease(now=timestamp)
+
+        async def action(connection: aiosqlite.Connection):
+            record, revision = await service._start_queue_execution_on(
+                connection,
                 principal=principal.subject,
                 scopes=principal.scopes,
                 if_match=if_match,
                 policy=body.policy,
+                timestamp=timestamp,
             )
-            view = await service.queue_execution_view(record.queue_execution_uid)
+            view = await service._queue_execution_view_on(connection, record.queue_execution_uid)
             return 201, _model_payload(view), queue_etag(revision)
 
         return await idempotent(
@@ -512,6 +649,8 @@ def create_app(
             if_match=if_match,
             body=body.model_dump(mode="json"),
             action=action,
+            before_transaction=expire_lease,
+            after_commit=wake_scheduler_after_commit,
         )
 
     @app.post("/api/v2/queue-executions/{queue_execution_uid}/stop", response_model=QueueExecutionView)
@@ -522,17 +661,33 @@ def create_app(
         if_match: Annotated[str | None, Header(alias="If-Match")] = None,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ):
-        async def action():
-            _, revision = await service.stop_queue_execution(
+        timestamp = service.store.now_micros()
+
+        async def expire_lease():
+            await service.store.expire_control_lease(now=timestamp)
+
+        async def action(connection: aiosqlite.Connection):
+            _, revision = await service._stop_queue_execution_on(
+                connection,
                 principal=principal.subject,
                 scopes=principal.scopes,
                 if_match=if_match,
                 queue_execution_uid=queue_execution_uid,
+                timestamp=timestamp,
             )
-            view = await service.queue_execution_view(queue_execution_uid)
+            view = await service._queue_execution_view_on(connection, queue_execution_uid)
             return 200, _model_payload(view), queue_etag(revision)
 
-        return await idempotent(request, principal, key=idempotency_key, if_match=if_match, body={}, action=action)
+        return await idempotent(
+            request,
+            principal,
+            key=idempotency_key,
+            if_match=if_match,
+            body={},
+            action=action,
+            before_transaction=expire_lease,
+            after_commit=wake_scheduler_after_commit,
+        )
 
     @app.post("/api/v2/attempts/{attempt_uid}/safe-stop", response_model=AttemptView)
     async def safe_stop(
@@ -542,17 +697,22 @@ def create_app(
         if_match: Annotated[str | None, Header(alias="If-Match")] = None,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ):
-        async def action():
-            _, revision = await service.safe_stop_attempt(
-                principal=principal.subject,
-                scopes=principal.scopes,
-                if_match=if_match,
-                attempt_uid=attempt_uid,
-            )
-            view = await service.attempt_view(attempt_uid)
-            return 200, _model_payload(view), queue_etag(revision)
-
-        return await idempotent(request, principal, key=idempotency_key, if_match=if_match, body={}, action=action)
+        context = idempotency_request(
+            request,
+            principal,
+            key=idempotency_key,
+            if_match=if_match,
+            body={},
+        )
+        result = await service.run_idempotent_safe_stop(
+            context,
+            principal=principal.subject,
+            scopes=principal.scopes,
+            if_match=if_match,
+            attempt_uid=attempt_uid,
+            timestamp=service.store.now_micros(),
+        )
+        return idempotency_response(result)
 
     @app.post("/api/v2/recovery/acknowledge", response_model=QueueSnapshot)
     async def acknowledge_recovery(
@@ -562,14 +722,29 @@ def create_app(
         if_match: Annotated[str | None, Header(alias="If-Match")] = None,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ):
-        async def action():
-            revision = await service.acknowledge_recovery(
-                principal=principal.subject,
+        timestamp = service.store.now_micros()
+        expected_revision = None
+        fence_evidence = None
+
+        async def prepare_recovery():
+            nonlocal expected_revision, fence_evidence
+            expected_revision, fence_evidence = await service._prepare_recovery_acknowledgement(
                 scopes=principal.scopes,
                 if_match=if_match,
-                acknowledgement=body,
             )
-            view = await service.queue_view()
+            await service.store.expire_control_lease(now=timestamp)
+
+        async def action(connection: aiosqlite.Connection):
+            assert expected_revision is not None
+            revision = await service._acknowledge_recovery_on(
+                connection,
+                principal=principal.subject,
+                acknowledgement=body,
+                expected_revision=expected_revision,
+                fence_evidence=fence_evidence,
+                timestamp=timestamp,
+            )
+            view = await service._queue_view_on(connection)
             return 200, _model_payload(view), queue_etag(revision)
 
         return await idempotent(
@@ -579,6 +754,8 @@ def create_app(
             if_match=if_match,
             body=body.model_dump(mode="json"),
             action=action,
+            before_transaction=prepare_recovery,
+            after_commit=service._finish_recovery_acknowledgement,
         )
 
     return app
