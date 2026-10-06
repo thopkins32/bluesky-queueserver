@@ -9,7 +9,7 @@ import re
 import sqlite3
 import sys
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -3442,7 +3442,7 @@ class SQLiteStore:
         )
 
     @asynccontextmanager
-    async def _transaction(self) -> AsyncIterator[aiosqlite.Connection]:
+    async def _transaction(self) -> AsyncGenerator[aiosqlite.Connection, None]:
         notify_events = False
         async with self._transaction_lock:
             connection = self._require_connection()

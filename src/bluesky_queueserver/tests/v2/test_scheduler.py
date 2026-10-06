@@ -8,14 +8,11 @@ from bluesky_queueserver.v2.contracts import (
     AttemptState,
     AuthorizationScope,
     OperationState,
-    OperationSubmission,
     QueueExecutionState,
-    QueueReorder,
     WorkerCatalog,
 )
 from bluesky_queueserver.v2.controller import (
     AuthorityFileLock,
-    AuthorizationError,
     ControllerAlreadyRunningError,
     ControllerAuthorityError,
     ControllerService,
@@ -25,16 +22,42 @@ from bluesky_queueserver.v2.controller import (
     parse_queue_etag,
     queue_etag,
 )
-from bluesky_queueserver.v2.storage import (
-    LeaseOwnershipError,
-    RevisionConflictError,
-    SQLiteStore,
-    StateConflictError,
-)
+from bluesky_queueserver.v2.storage import IdempotencyRequest, SQLiteStore, StateConflictError
 
 
 def run(coroutine):
     return asyncio.run(coroutine)
+
+
+async def submit_simulated(store, *, revision, num=1, delay=0.0):
+    return await store.submit_operation(
+        principal="operator",
+        expected_revision=revision,
+        descriptor=SIMULATED_COUNT_DESCRIPTOR,
+        operation_id="simulated-count",
+        operation_version="1",
+        parameters={"detectors": ["det"], "num": num, "delay": delay},
+    )
+
+
+async def safe_stop(service, *, attempt_uid, revision, key):
+    if_match = queue_etag(revision)
+    request = IdempotencyRequest(
+        principal="operator",
+        method="POST",
+        target=f"/api/v2/attempts/{attempt_uid}/safe-stop",
+        key=key,
+        body={},
+        if_match=if_match,
+    )
+    return await service.safe_stop_attempt(
+        request,
+        principal="operator",
+        scopes=[AuthorizationScope.CONTROL],
+        if_match=if_match,
+        attempt_uid=attempt_uid,
+        timestamp=service.store.now_micros(),
+    )
 
 
 def test_controller_holds_one_authority_lock_and_scheduler(tmp_path):
@@ -126,37 +149,24 @@ def test_safe_stop_before_worker_contact_aborts_without_execute(tmp_path):
         service = ControllerService(store, worker=worker)
         await service.open()
         try:
-            await service.acquire_control_lease(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-            )
-            operation, revision = await service.submit_operation(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(0),
-                submission=OperationSubmission(
-                    operation_id="simulated-count",
-                    operation_version="1",
-                    parameters={"detectors": ["det"]},
-                ),
-            )
+            await store.acquire_control_lease(principal="operator")
+            operation, revision = await submit_simulated(store, revision=0)
             execution, _ = await store.start_queue_execution(
                 principal="operator",
                 expected_revision=revision,
             )
             dispatch = await store.claim_next_attempt(worker_instance_uid=worker.worker_instance_uid)
             assert dispatch is not None
-            revision = await store.current_revision()
 
-            stopped, _ = await service.safe_stop_attempt(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(revision),
+            await safe_stop(
+                service,
                 attempt_uid=dispatch.attempt.attempt_uid,
+                revision=await store.current_revision(),
+                key="safe-stop-before-contact",
             )
-            service.wake_scheduler()
             await service.wait_scheduler_idle()
 
+            stopped = await store.get_attempt(dispatch.attempt.attempt_uid)
             assert stopped.state is AttemptState.ABORTED
             assert worker.started.empty()
             assert worker.stop_requests == []
@@ -177,39 +187,27 @@ def test_safe_stop_running_attempt_is_correlated_once_and_stops_batch(tmp_path):
         service = ControllerService(store, worker=worker)
         await service.open()
         try:
-            await service.acquire_control_lease(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-            )
+            await store.acquire_control_lease(principal="operator")
             revision = 0
             operations = []
             for num in (1, 2):
-                operation, revision = await service.submit_operation(
-                    principal="operator",
-                    scopes=[AuthorizationScope.CONTROL],
-                    if_match=queue_etag(revision),
-                    submission=OperationSubmission(
-                        operation_id="simulated-count",
-                        operation_version="1",
-                        parameters={"detectors": ["det"], "num": num},
-                    ),
-                )
+                operation, revision = await submit_simulated(store, revision=revision, num=num)
                 operations.append(operation)
-            execution, _ = await service.start_queue_execution(
+            execution, _ = await store.start_queue_execution(
                 principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(revision),
+                expected_revision=revision,
             )
+            service.wake_scheduler()
             attempt, _, _, _ = await worker.started.get()
             await wait_for_event(store, "operation.running")
-            revision = await store.current_revision()
 
-            acknowledged, _ = await service.safe_stop_attempt(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(revision),
+            await safe_stop(
+                service,
                 attempt_uid=attempt.attempt_uid,
+                revision=await store.current_revision(),
+                key="safe-stop-running",
             )
+            acknowledged = await store.get_attempt(attempt.attempt_uid)
             assert acknowledged.stop_acknowledged_at is not None
             await service.wait_scheduler_idle()
 
@@ -225,11 +223,11 @@ def test_safe_stop_running_attempt_is_correlated_once_and_stops_batch(tmp_path):
 
             revision = await store.current_revision()
             with pytest.raises(StateConflictError, match="terminal"):
-                await service.safe_stop_attempt(
-                    principal="operator",
-                    scopes=[AuthorizationScope.CONTROL],
-                    if_match=queue_etag(revision),
+                await safe_stop(
+                    service,
                     attempt_uid=attempt.attempt_uid,
+                    revision=revision,
+                    key="safe-stop-terminal",
                 )
             assert worker.stop_requests == [attempt.attempt_uid]
             assert await store.current_revision() == revision
@@ -246,10 +244,7 @@ def test_scheduler_dispatches_admitted_operations_in_fifo_order(tmp_path):
         service = ControllerService(store, worker=worker)
         await service.open()
         try:
-            await service.acquire_control_lease(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-            )
+            await store.acquire_control_lease(principal="operator")
             operation_uids = []
             revision = 0
             for num in (1, 2, 3):
@@ -305,106 +300,6 @@ class MutableClock:
         return self.value
 
 
-def test_service_enforces_scope_ownership_override_and_expiry(tmp_path):
-    async def scenario():
-        clock = MutableClock()
-        store = SQLiteStore(tmp_path / "state.sqlite", instrument_id="instrument", clock=clock)
-        service = ControllerService(store)
-        await service.open()
-        try:
-            with pytest.raises(AuthorizationError):
-                await service.acquire_control_lease(
-                    principal="alice",
-                    scopes=[AuthorizationScope.READ],
-                )
-
-            lease = await service.acquire_control_lease(
-                principal="alice",
-                scopes=[AuthorizationScope.CONTROL],
-                ttl_seconds=5,
-            )
-            assert lease.holder == "alice"
-            assert "lease_uid" not in lease.model_fields
-
-            with pytest.raises(AuthorizationError):
-                await service.override_control_lease(
-                    administrator="admin",
-                    scopes=[AuthorizationScope.CONTROL],
-                    reason="handoff",
-                )
-            overridden = await service.override_control_lease(
-                administrator="admin",
-                scopes=[AuthorizationScope.ADMIN],
-                reason="handoff",
-                ttl_seconds=5,
-            )
-            assert overridden.holder == "admin"
-
-            clock.value = 5_000_000
-            assert await service.check_lease_expiry()
-            assert (await service.control_lease()).holder is None
-            assert not await service.check_lease_expiry()
-        finally:
-            await service.close()
-
-    run(scenario())
-
-
-def test_service_requires_owned_lease_scope_and_exact_queue_etag(tmp_path):
-    async def scenario():
-        store = SQLiteStore(tmp_path / "state.sqlite", instrument_id="instrument")
-        worker = BarrierWorker(store.worker_lock_path)
-        service = ControllerService(store, worker=worker)
-        await service.open()
-        try:
-            submission = OperationSubmission(
-                operation_id="simulated-count",
-                operation_version="1",
-                parameters={"detectors": ["det"]},
-            )
-            with pytest.raises(MissingPreconditionError):
-                await service.submit_operation(
-                    principal="operator",
-                    scopes=[AuthorizationScope.CONTROL],
-                    if_match=None,
-                    submission=submission,
-                )
-
-            await service.acquire_control_lease(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-            )
-            operation, revision = await service.submit_operation(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(0),
-                submission=submission,
-            )
-            assert revision == 1
-            assert queue_etag(revision) == '"qrev-1"'
-            assert (await store.get_operation(operation.operation_uid)).state is OperationState.QUEUED
-
-            with pytest.raises(RevisionConflictError):
-                await service.submit_operation(
-                    principal="operator",
-                    scopes=[AuthorizationScope.CONTROL],
-                    if_match=queue_etag(0),
-                    submission=submission,
-                )
-            with pytest.raises(LeaseOwnershipError):
-                await service.submit_operation(
-                    principal="other",
-                    scopes=[AuthorizationScope.CONTROL],
-                    if_match=queue_etag(revision),
-                    submission=submission,
-                )
-            assert (await service.queue()).revision == revision
-        finally:
-            await service.close()
-
-    run(scenario())
-
-
 def test_queue_etag_parser_rejects_missing_malformed_and_overflow():
     assert parse_queue_etag('"qrev-0"') == 0
     assert parse_queue_etag('"qrev-42"') == 42
@@ -434,78 +329,53 @@ def test_scheduler_serializes_live_edits_and_continues_after_lease_expiry(tmp_pa
         service = ControllerService(store, worker=worker)
         await service.open()
         try:
-            await service.acquire_control_lease(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                ttl_seconds=5,
-            )
+            await store.acquire_control_lease(principal="operator", ttl_seconds=5)
             submitted = []
             revision = 0
             for num in (1, 2, 3):
-                operation, revision = await service.submit_operation(
-                    principal="operator",
-                    scopes=[AuthorizationScope.CONTROL],
-                    if_match=queue_etag(revision),
-                    submission=OperationSubmission(
-                        operation_id="simulated-count",
-                        operation_version="1",
-                        parameters={"detectors": ["det"], "num": num},
-                    ),
-                )
+                operation, revision = await submit_simulated(store, revision=revision, num=num)
                 submitted.append(operation)
-            execution, _ = await service.start_queue_execution(
+            execution, _ = await store.start_queue_execution(
                 principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(revision),
+                expected_revision=revision,
             )
+            service.wake_scheduler()
 
             first_attempt, _, _, first_completion = await worker.started.get()
             await wait_for_event(store, "operation.running")
             revision = await store.current_revision()
 
-            fourth, revision = await service.submit_operation(
+            fourth, revision = await submit_simulated(store, revision=revision, num=4)
+            _, revision = await store.cancel_operation(
                 principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(revision),
-                submission=OperationSubmission(
-                    operation_id="simulated-count",
-                    operation_version="1",
-                    parameters={"detectors": ["det"], "num": 4},
-                ),
-            )
-            _, revision = await service.cancel_operation(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(revision),
+                expected_revision=revision,
                 operation_uid=submitted[1].operation_uid,
             )
-            replacement, revision = await service.replace_operation(
+            replacement, revision = await store.replace_operation(
                 principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(revision),
+                expected_revision=revision,
                 operation_uid=submitted[2].operation_uid,
-                submission=OperationSubmission(
-                    operation_id="simulated-count",
-                    operation_version="1",
-                    parameters={"detectors": ["det"], "num": 5},
-                ),
+                descriptor=SIMULATED_COUNT_DESCRIPTOR,
+                operation_id="simulated-count",
+                operation_version="1",
+                parameters={"detectors": ["det"], "num": 5},
             )
-            snapshot = await service.reorder_queue(
+            snapshot = await store.reorder_queue(
                 principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(revision),
-                reorder=QueueReorder(operation_uids=[replacement.operation_uid, fourth.operation_uid]),
+                expected_revision=revision,
+                operation_uids=[replacement.operation_uid, fourth.operation_uid],
             )
             with pytest.raises(StateConflictError, match="not queued"):
-                await service.cancel_operation(
+                await store.cancel_operation(
                     principal="operator",
-                    scopes=[AuthorizationScope.CONTROL],
-                    if_match=queue_etag(snapshot.revision),
+                    expected_revision=snapshot.revision,
                     operation_uid=submitted[0].operation_uid,
                 )
+            service.wake_scheduler()
 
             clock.value = 5_000_000
-            assert await service.check_lease_expiry()
+            assert await store.expire_control_lease()
+            service.wake_scheduler()
             first_uid = str(uuid4())
             first_completion.set_result(
                 WorkerCompletion(
@@ -554,29 +424,17 @@ def test_scheduler_blocks_on_first_non_success_without_retry(tmp_path, terminal_
         service = ControllerService(store, worker=worker)
         await service.open()
         try:
-            await service.acquire_control_lease(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-            )
+            await store.acquire_control_lease(principal="operator")
             revision = 0
             operation_uids = []
             for num in (1, 2):
-                operation, revision = await service.submit_operation(
-                    principal="operator",
-                    scopes=[AuthorizationScope.CONTROL],
-                    if_match=queue_etag(revision),
-                    submission=OperationSubmission(
-                        operation_id="simulated-count",
-                        operation_version="1",
-                        parameters={"detectors": ["det"], "num": num},
-                    ),
-                )
+                operation, revision = await submit_simulated(store, revision=revision, num=num)
                 operation_uids.append(operation.operation_uid)
-            execution, _ = await service.start_queue_execution(
+            execution, _ = await store.start_queue_execution(
                 principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(revision),
+                expected_revision=revision,
             )
+            service.wake_scheduler()
             attempt, _, _, completion = await worker.started.get()
             completion.set_result(
                 WorkerCompletion(
@@ -610,38 +468,26 @@ def test_stop_after_current_leaves_remaining_work_queued(tmp_path):
         service = ControllerService(store, worker=worker)
         await service.open()
         try:
-            await service.acquire_control_lease(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-            )
+            await store.acquire_control_lease(principal="operator")
             revision = 0
             operations = []
             for num in (1, 2):
-                operation, revision = await service.submit_operation(
-                    principal="operator",
-                    scopes=[AuthorizationScope.CONTROL],
-                    if_match=queue_etag(revision),
-                    submission=OperationSubmission(
-                        operation_id="simulated-count",
-                        operation_version="1",
-                        parameters={"detectors": ["det"], "num": num},
-                    ),
-                )
+                operation, revision = await submit_simulated(store, revision=revision, num=num)
                 operations.append(operation)
-            execution, _ = await service.start_queue_execution(
+            execution, _ = await store.start_queue_execution(
                 principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(revision),
+                expected_revision=revision,
             )
+            service.wake_scheduler()
             _, _, _, completion = await worker.started.get()
             await wait_for_event(store, "operation.running")
             revision = await store.current_revision()
-            stopping, _ = await service.stop_queue_execution(
+            stopping, _ = await store.stop_queue_execution(
                 principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(revision),
+                expected_revision=revision,
                 queue_execution_uid=execution.queue_execution_uid,
             )
+            service.wake_scheduler()
             assert stopping.state is QueueExecutionState.STOPPING
 
             run_uid = str(uuid4())

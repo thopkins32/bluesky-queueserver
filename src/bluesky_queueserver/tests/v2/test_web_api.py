@@ -518,10 +518,7 @@ def test_sse_backlog_cursor_heartbeat_and_token_expiry(tmp_path):
             base_url="https://testserver",
         )
         try:
-            await service.acquire_control_lease(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-            )
+            await store.acquire_control_lease(principal="operator")
             response = await client.get("/api/v2/events/stream?after=0", headers=headers)
             assert response.status_code == 200
             assert "event: lease.acquired\n" in response.text

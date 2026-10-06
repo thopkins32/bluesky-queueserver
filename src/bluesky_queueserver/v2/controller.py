@@ -524,19 +524,6 @@ class ControllerService:
     async def wait_for_events(self, *, after: int, limit: int = 100, timeout: float | None = None):
         return await self.store.wait_for_events(after=after, limit=limit, timeout=timeout)
 
-    async def acquire_control_lease(
-        self,
-        *,
-        principal: str,
-        scopes: Iterable[str],
-        ttl_seconds: int = 300,
-    ) -> ControlLeaseView:
-        self._require_open()
-        self._require_scope(scopes, AuthorizationScope.CONTROL)
-        lease = await self.store.acquire_control_lease(principal=principal, ttl_seconds=ttl_seconds)
-        self._scheduler_wakeup.set()
-        return ControlLeaseView(holder=lease.subject, expires_at=lease.expires_at)
-
     async def _acquire_control_lease_on(
         self,
         connection: aiosqlite.Connection,
@@ -555,19 +542,6 @@ class ControllerService:
             timestamp=timestamp,
             lease_uid=str(uuid4()),
         )
-        return ControlLeaseView(holder=lease.subject, expires_at=lease.expires_at)
-
-    async def renew_control_lease(
-        self,
-        *,
-        principal: str,
-        scopes: Iterable[str],
-        ttl_seconds: int = 300,
-    ) -> ControlLeaseView:
-        self._require_open()
-        self._require_scope(scopes, AuthorizationScope.CONTROL)
-        lease = await self.store.renew_control_lease(principal=principal, ttl_seconds=ttl_seconds)
-        self._scheduler_wakeup.set()
         return ControlLeaseView(holder=lease.subject, expires_at=lease.expires_at)
 
     async def _renew_control_lease_on(
@@ -592,12 +566,6 @@ class ControllerService:
         assert lease is not None
         return ControlLeaseView(holder=lease.subject, expires_at=lease.expires_at)
 
-    async def release_control_lease(self, *, principal: str, scopes: Iterable[str]) -> None:
-        self._require_open()
-        self._require_scope(scopes, AuthorizationScope.CONTROL)
-        await self.store.release_control_lease(principal=principal)
-        self._scheduler_wakeup.set()
-
     async def _release_control_lease_on(
         self,
         connection: aiosqlite.Connection,
@@ -615,24 +583,6 @@ class ControllerService:
         )
         if expired:
             raise LeaseExpiredError("control lease has expired")
-
-    async def override_control_lease(
-        self,
-        *,
-        administrator: str,
-        scopes: Iterable[str],
-        reason: str,
-        ttl_seconds: int = 300,
-    ) -> ControlLeaseView:
-        self._require_open()
-        self._require_scope(scopes, AuthorizationScope.ADMIN)
-        lease = await self.store.override_control_lease(
-            administrator=administrator,
-            reason=reason,
-            ttl_seconds=ttl_seconds,
-        )
-        self._scheduler_wakeup.set()
-        return ControlLeaseView(holder=lease.subject, expires_at=lease.expires_at)
 
     async def _override_control_lease_on(
         self,
@@ -655,37 +605,6 @@ class ControllerService:
             lease_uid=str(uuid4()),
         )
         return ControlLeaseView(holder=lease.subject, expires_at=lease.expires_at)
-
-    async def check_lease_expiry(self, *, now: int | None = None) -> bool:
-        self._require_open()
-        expired = await self.store.expire_control_lease(now=now)
-        if expired:
-            self._scheduler_wakeup.set()
-        return expired
-
-    async def submit_operation(
-        self,
-        *,
-        principal: str,
-        scopes: Iterable[str],
-        if_match: str | None,
-        submission: OperationSubmission,
-    ) -> tuple[OperationRecord, int]:
-        expected_revision, descriptor, validated = self._prepare_operation_mutation(
-            scopes=scopes,
-            if_match=if_match,
-            submission=submission,
-        )
-        result = await self.store.submit_operation(
-            principal=principal,
-            expected_revision=expected_revision,
-            descriptor=descriptor,
-            operation_id=submission.operation_id,
-            operation_version=submission.operation_version,
-            parameters=validated,
-        )
-        self._scheduler_wakeup.set()
-        return result
 
     async def _submit_operation_on(
         self,
@@ -713,23 +632,6 @@ class ControllerService:
             timestamp=timestamp,
         )
 
-    async def cancel_operation(
-        self,
-        *,
-        principal: str,
-        scopes: Iterable[str],
-        if_match: str | None,
-        operation_uid: str,
-    ) -> tuple[OperationRecord, int]:
-        expected_revision = self._prepare_control_mutation(scopes=scopes, if_match=if_match)
-        result = await self.store.cancel_operation(
-            principal=principal,
-            expected_revision=expected_revision,
-            operation_uid=operation_uid,
-        )
-        self._scheduler_wakeup.set()
-        return result
-
     async def _cancel_operation_on(
         self,
         connection: aiosqlite.Connection,
@@ -747,32 +649,6 @@ class ControllerService:
             operation_uid=operation_uid,
             timestamp=timestamp,
         )
-
-    async def replace_operation(
-        self,
-        *,
-        principal: str,
-        scopes: Iterable[str],
-        if_match: str | None,
-        operation_uid: str,
-        submission: OperationSubmission,
-    ) -> tuple[OperationRecord, int]:
-        expected_revision, descriptor, validated = self._prepare_operation_mutation(
-            scopes=scopes,
-            if_match=if_match,
-            submission=submission,
-        )
-        result = await self.store.replace_operation(
-            principal=principal,
-            expected_revision=expected_revision,
-            operation_uid=operation_uid,
-            descriptor=descriptor,
-            operation_id=submission.operation_id,
-            operation_version=submission.operation_version,
-            parameters=validated,
-        )
-        self._scheduler_wakeup.set()
-        return result
 
     async def _replace_operation_on(
         self,
@@ -802,23 +678,6 @@ class ControllerService:
             timestamp=timestamp,
         )
 
-    async def reorder_queue(
-        self,
-        *,
-        principal: str,
-        scopes: Iterable[str],
-        if_match: str | None,
-        reorder: QueueReorder,
-    ) -> QueueRecord:
-        expected_revision = self._prepare_control_mutation(scopes=scopes, if_match=if_match)
-        result = await self.store.reorder_queue(
-            principal=principal,
-            expected_revision=expected_revision,
-            operation_uids=reorder.operation_uids,
-        )
-        self._scheduler_wakeup.set()
-        return result
-
     async def _reorder_queue_on(
         self,
         connection: aiosqlite.Connection,
@@ -836,25 +695,6 @@ class ControllerService:
             operation_uids=reorder.operation_uids,
             timestamp=timestamp,
         )
-
-    async def start_queue_execution(
-        self,
-        *,
-        principal: str,
-        scopes: Iterable[str],
-        if_match: str | None,
-        policy: QueueExecutionPolicy = QueueExecutionPolicy.STOP_ON_NON_SUCCESS,
-    ) -> tuple[QueueExecutionRecord, int]:
-        expected_revision = self._prepare_control_mutation(scopes=scopes, if_match=if_match)
-        if not self._dispatch_ready:
-            raise RuntimeError("dispatch is not ready")
-        result = await self.store.start_queue_execution(
-            principal=principal,
-            expected_revision=expected_revision,
-            policy=policy,
-        )
-        self._scheduler_wakeup.set()
-        return result
 
     async def _start_queue_execution_on(
         self,
@@ -878,23 +718,6 @@ class ControllerService:
             queue_execution_uid=str(uuid4()),
         )
 
-    async def stop_queue_execution(
-        self,
-        *,
-        principal: str,
-        scopes: Iterable[str],
-        if_match: str | None,
-        queue_execution_uid: str,
-    ) -> tuple[QueueExecutionRecord, int]:
-        expected_revision = self._prepare_control_mutation(scopes=scopes, if_match=if_match)
-        result = await self.store.stop_queue_execution(
-            principal=principal,
-            expected_revision=expected_revision,
-            queue_execution_uid=queue_execution_uid,
-        )
-        self._scheduler_wakeup.set()
-        return result
-
     async def _stop_queue_execution_on(
         self,
         connection: aiosqlite.Connection,
@@ -914,56 +737,6 @@ class ControllerService:
         )
 
     async def safe_stop_attempt(
-        self,
-        *,
-        principal: str,
-        scopes: Iterable[str],
-        if_match: str | None,
-        attempt_uid: str,
-    ) -> tuple[AttemptRecord, int]:
-        self._require_scope(scopes, AuthorizationScope.CONTROL)
-        lock = self._attempt_locks.setdefault(attempt_uid, asyncio.Lock())
-        async with lock:
-            stop = await self.store.request_attempt_stop(
-                principal=principal,
-                expected_revision=parse_queue_etag(if_match),
-                attempt_uid=attempt_uid,
-            )
-            if not stop.contact_worker:
-                self._attempt_locks.pop(attempt_uid, None)
-                self._scheduler_wakeup.set()
-                return stop.attempt, stop.queue_revision
-            if self.worker is None:
-                completed = await self.store.complete_attempt(
-                    attempt_uid=attempt_uid,
-                    state=AttemptState.UNKNOWN,
-                    result=None,
-                    run_uids=stop.attempt.run_uids,
-                    diagnostic="worker is unavailable during safe stop",
-                    cleanup_completed=False,
-                )
-                await self._fence_worker_after_ambiguous_outcome()
-                return completed, await self.store.current_revision()
-            try:
-                await asyncio.wait_for(
-                    self.worker.request_safe_stop(attempt_uid=attempt_uid),
-                    timeout=self._protocol_timeout_seconds,
-                )
-            except Exception as exc:
-                completed = await self.store.complete_attempt(
-                    attempt_uid=attempt_uid,
-                    state=AttemptState.UNKNOWN,
-                    result=None,
-                    run_uids=stop.attempt.run_uids,
-                    diagnostic=f"safe-stop protocol failed: {exc}",
-                    cleanup_completed=False,
-                )
-                await self._fence_worker_after_ambiguous_outcome()
-                return completed, await self.store.current_revision()
-            acknowledged, revision = await self.store.acknowledge_attempt_stop(attempt_uid=attempt_uid)
-            return acknowledged, revision
-
-    async def run_idempotent_safe_stop(
         self,
         request: IdempotencyRequest,
         *,
@@ -1051,24 +824,40 @@ class ControllerService:
 
     async def acknowledge_recovery(
         self,
+        request: IdempotencyRequest,
         *,
         principal: str,
         scopes: Iterable[str],
         if_match: str | None,
         acknowledgement: RecoveryAcknowledgement,
-    ) -> int:
+        timestamp: int,
+    ) -> IdempotencyResult:
         expected_revision, fence_evidence = await self._prepare_recovery_acknowledgement(
             scopes=scopes,
             if_match=if_match,
         )
-        revision = await self.store.acknowledge_recovery(
-            principal=principal,
-            expected_revision=expected_revision,
-            note=acknowledgement.note,
-            fence_evidence=fence_evidence,
-        )
-        await self._finish_recovery_acknowledgement()
-        return revision
+        await self.store.expire_control_lease(now=timestamp)
+
+        async def action(connection: aiosqlite.Connection) -> StoredHttpResponse:
+            revision = await self._acknowledge_recovery_on(
+                connection,
+                principal=principal,
+                acknowledgement=acknowledgement,
+                expected_revision=expected_revision,
+                fence_evidence=fence_evidence,
+                timestamp=timestamp,
+            )
+            view = await self._queue_view_on(connection)
+            return StoredHttpResponse(
+                status=200,
+                body=json.loads(view.model_dump_json()),
+                etag=queue_etag(revision),
+            )
+
+        result = await self.store.run_idempotent_mutation(request, action, now=timestamp)
+        if not result.replayed:
+            await self._finish_recovery_acknowledgement()
+        return result
 
     async def _prepare_recovery_acknowledgement(
         self,
@@ -1270,20 +1059,7 @@ class ControllerService:
         return completion.state is AttemptState.SUCCEEDED and not self._closing
 
     async def _fence_worker_after_ambiguous_outcome(self) -> None:
-        worker = self.worker
-        if worker is None:
-            return
-        if self._worker_started:
-            try:
-                await worker.disconnect()
-            except Exception:
-                return
-            else:
-                self._worker_started = False
-        evidence = probe_worker_authority(
-            self.store.worker_lock_path,
-            observed_at=self.store.now_micros(),
-        )
+        evidence = await self._end_ambiguous_worker_authority()
         if evidence is not None:
             await self.store.record_worker_fenced(evidence=evidence)
 
@@ -1291,26 +1067,28 @@ class ControllerService:
         self,
         connection: aiosqlite.Connection,
     ) -> None:
-        worker = self.worker
-        if worker is None:
-            return
-        if self._worker_started:
-            try:
-                await worker.disconnect()
-            except Exception:
-                return
-            else:
-                self._worker_started = False
-        evidence = probe_worker_authority(
-            self.store.worker_lock_path,
-            observed_at=self.store.now_micros(),
-        )
+        evidence = await self._end_ambiguous_worker_authority()
         if evidence is not None:
             await self.store._record_worker_fenced_on(
                 connection,
                 evidence=evidence,
                 timestamp=self.store.now_micros(),
             )
+
+    async def _end_ambiguous_worker_authority(self) -> Mapping[str, object] | None:
+        worker = self.worker
+        if worker is None:
+            return None
+        if self._worker_started:
+            try:
+                await worker.disconnect()
+            except Exception:
+                return None
+            self._worker_started = False
+        return probe_worker_authority(
+            self.store.worker_lock_path,
+            observed_at=self.store.now_micros(),
+        )
 
     async def _operation_view(self, record: OperationRecord) -> OperationView:
         attempt = await self.store.get_latest_attempt_for_operation(record.operation_uid)

@@ -704,7 +704,7 @@ def create_app(
             if_match=if_match,
             body={},
         )
-        result = await service.run_idempotent_safe_stop(
+        result = await service.safe_stop_attempt(
             context,
             principal=principal.subject,
             scopes=principal.scopes,
@@ -722,40 +722,21 @@ def create_app(
         if_match: Annotated[str | None, Header(alias="If-Match")] = None,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ):
-        timestamp = service.store.now_micros()
-        expected_revision = None
-        fence_evidence = None
-
-        async def prepare_recovery():
-            nonlocal expected_revision, fence_evidence
-            expected_revision, fence_evidence = await service._prepare_recovery_acknowledgement(
-                scopes=principal.scopes,
-                if_match=if_match,
-            )
-            await service.store.expire_control_lease(now=timestamp)
-
-        async def action(connection: aiosqlite.Connection):
-            assert expected_revision is not None
-            revision = await service._acknowledge_recovery_on(
-                connection,
-                principal=principal.subject,
-                acknowledgement=body,
-                expected_revision=expected_revision,
-                fence_evidence=fence_evidence,
-                timestamp=timestamp,
-            )
-            view = await service._queue_view_on(connection)
-            return 200, _model_payload(view), queue_etag(revision)
-
-        return await idempotent(
+        context = idempotency_request(
             request,
             principal,
             key=idempotency_key,
             if_match=if_match,
             body=body.model_dump(mode="json"),
-            action=action,
-            before_transaction=prepare_recovery,
-            after_commit=service._finish_recovery_acknowledgement,
         )
+        result = await service.acknowledge_recovery(
+            context,
+            principal=principal.subject,
+            scopes=principal.scopes,
+            if_match=if_match,
+            acknowledgement=body,
+            timestamp=service.store.now_micros(),
+        )
+        return idempotency_response(result)
 
     return app

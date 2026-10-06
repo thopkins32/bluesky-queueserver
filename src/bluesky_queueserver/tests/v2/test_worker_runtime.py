@@ -8,15 +8,15 @@ import pytest
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from bluesky_queueserver.v2.contracts import (
+    SIMULATED_COUNT_DESCRIPTOR,
     AttemptState,
     AuthorizationScope,
     OperationState,
-    OperationSubmission,
     OrphanPolicy,
     StrictModel,
 )
 from bluesky_queueserver.v2.controller import ControllerService, queue_etag
-from bluesky_queueserver.v2.storage import SQLiteStore
+from bluesky_queueserver.v2.storage import IdempotencyRequest, SQLiteStore
 from bluesky_queueserver.v2.worker.profile import ProfileLoadError, load_profile
 from bluesky_queueserver.v2.worker.runtime import WorkerAuthorityError, WorkerAuthorityLock
 from bluesky_queueserver.v2.worker.sdk import (
@@ -369,25 +369,9 @@ def test_real_worker_runs_simulated_count_and_stays_ping_responsive(tmp_path):
                 "startup_source_sha256": None,
                 "adapter_source_sha256": None,
             }
-            await service.acquire_control_lease(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-            )
-            operation, revision = await service.submit_operation(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(0),
-                submission=OperationSubmission(
-                    operation_id="simulated-count",
-                    operation_version="1",
-                    parameters={"detectors": ["det"], "num": 3, "delay": 0.2},
-                ),
-            )
-            await service.start_queue_execution(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(revision),
-            )
+            await store.acquire_control_lease(principal="operator")
+            operation, revision = await submit_simulated(store, revision=0, num=3, delay=0.2)
+            await start_queue(service, revision=revision)
             await wait_for_operation_state(store, operation.operation_uid, OperationState.RUNNING)
             await gateway.ping()
             await wait_for_operation_state(store, operation.operation_uid, OperationState.SUCCEEDED)
@@ -426,47 +410,70 @@ def make_real_service(tmp_path):
     return store, gateway, ControllerService(store, worker=gateway)
 
 
+async def submit_simulated(store, *, revision, num, delay):
+    return await store.submit_operation(
+        principal="operator",
+        expected_revision=revision,
+        descriptor=SIMULATED_COUNT_DESCRIPTOR,
+        operation_id="simulated-count",
+        operation_version="1",
+        parameters={"detectors": ["det"], "num": num, "delay": delay},
+    )
+
+
+async def start_queue(service, *, revision):
+    result = await service.store.start_queue_execution(
+        principal="operator",
+        expected_revision=revision,
+    )
+    service.wake_scheduler()
+    return result
+
+
+async def request_safe_stop(service, *, attempt_uid, revision):
+    if_match = queue_etag(revision)
+    request = IdempotencyRequest(
+        principal="operator",
+        method="POST",
+        target=f"/api/v2/attempts/{attempt_uid}/safe-stop",
+        key=f"safe-stop-{attempt_uid}",
+        body={},
+        if_match=if_match,
+    )
+    return await service.safe_stop_attempt(
+        request,
+        principal="operator",
+        scopes=[AuthorizationScope.CONTROL],
+        if_match=if_match,
+        attempt_uid=attempt_uid,
+        timestamp=service.store.now_micros(),
+    )
+
+
 @pytest.mark.parametrize("stop_after_current", [False, True])
 def test_real_worker_safe_stop_aborts_at_checkpoint(tmp_path, stop_after_current):
     async def scenario():
         store, gateway, service = make_real_service(tmp_path)
         await service.open()
         try:
-            await service.acquire_control_lease(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-            )
-            operation, revision = await service.submit_operation(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(0),
-                submission=OperationSubmission(
-                    operation_id="simulated-count",
-                    operation_version="1",
-                    parameters={"detectors": ["det"], "num": 10, "delay": 0.2},
-                ),
-            )
-            execution, _ = await service.start_queue_execution(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(revision),
-            )
+            await store.acquire_control_lease(principal="operator")
+            operation, revision = await submit_simulated(store, revision=0, num=10, delay=0.2)
+            execution, _ = await start_queue(service, revision=revision)
             await wait_for_operation_state(store, operation.operation_uid, OperationState.RUNNING)
             revision = await store.current_revision()
             if stop_after_current:
-                _, revision = await service.stop_queue_execution(
+                _, revision = await store.stop_queue_execution(
                     principal="operator",
-                    scopes=[AuthorizationScope.CONTROL],
-                    if_match=queue_etag(revision),
+                    expected_revision=revision,
                     queue_execution_uid=execution.queue_execution_uid,
                 )
+                service.wake_scheduler()
             attempt = await store.get_active_attempt()
             assert attempt is not None
-            await service.safe_stop_attempt(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(revision),
+            await request_safe_stop(
+                service,
                 attempt_uid=attempt.attempt_uid,
+                revision=revision,
             )
             await wait_for_operation_state(
                 store,
@@ -490,25 +497,9 @@ def test_controller_socket_loss_requests_orphan_stop_and_releases_worker_lock(tm
         store, gateway, service = make_real_service(tmp_path)
         await service.open()
         try:
-            await service.acquire_control_lease(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-            )
-            operation, revision = await service.submit_operation(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(0),
-                submission=OperationSubmission(
-                    operation_id="simulated-count",
-                    operation_version="1",
-                    parameters={"detectors": ["det"], "num": 10, "delay": 0.2},
-                ),
-            )
-            await service.start_queue_execution(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(revision),
-            )
+            await store.acquire_control_lease(principal="operator")
+            operation, revision = await submit_simulated(store, revision=0, num=10, delay=0.2)
+            await start_queue(service, revision=revision)
             await wait_for_operation_state(store, operation.operation_uid, OperationState.RUNNING)
             exit_code = await gateway.disconnect()
             assert exit_code == 2
@@ -551,29 +542,13 @@ def test_post_claim_protocol_fault_becomes_unknown_once(tmp_path, mode):
         service = ControllerService(store, worker=gateway, protocol_timeout_seconds=0.5)
         await service.open()
         try:
-            await service.acquire_control_lease(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-            )
+            await store.acquire_control_lease(principal="operator")
             revision = 0
             operations = []
             for num in (1, 2):
-                operation, revision = await service.submit_operation(
-                    principal="operator",
-                    scopes=[AuthorizationScope.CONTROL],
-                    if_match=queue_etag(revision),
-                    submission=OperationSubmission(
-                        operation_id="simulated-count",
-                        operation_version="1",
-                        parameters={"detectors": ["det"], "num": num},
-                    ),
-                )
+                operation, revision = await submit_simulated(store, revision=revision, num=num, delay=0.0)
                 operations.append(operation)
-            execution, _ = await service.start_queue_execution(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(revision),
-            )
+            execution, _ = await start_queue(service, revision=revision)
             await wait_for_operation_state(store, operations[0].operation_uid, OperationState.UNKNOWN)
             await service.wait_scheduler_idle()
 

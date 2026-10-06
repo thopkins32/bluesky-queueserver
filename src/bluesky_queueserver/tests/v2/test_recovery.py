@@ -10,19 +10,39 @@ from bluesky_queueserver.v2.contracts import (
     AttemptState,
     AuthorizationScope,
     OperationState,
-    OperationSubmission,
     QueueExecutionState,
     RecoveryAcknowledgement,
     WorkerCatalog,
 )
 from bluesky_queueserver.v2.controller import ControllerService, queue_etag
-from bluesky_queueserver.v2.storage import SQLiteStore, StateConflictError
+from bluesky_queueserver.v2.storage import IdempotencyRequest, SQLiteStore, StateConflictError
 from bluesky_queueserver.v2.worker.runtime import WorkerAuthorityLock
 from bluesky_queueserver.v2.worker_protocol import SubprocessWorkerGateway
 
 
 def run(coroutine):
     return asyncio.run(coroutine)
+
+
+async def acknowledge_recovery(service, *, revision, note, key):
+    if_match = queue_etag(revision)
+    acknowledgement = RecoveryAcknowledgement(note=note)
+    request = IdempotencyRequest(
+        principal="operator",
+        method="POST",
+        target="/api/v2/recovery/acknowledge",
+        key=key,
+        body=acknowledgement.model_dump(mode="json"),
+        if_match=if_match,
+    )
+    return await service.acknowledge_recovery(
+        request,
+        principal="operator",
+        scopes=[AuthorizationScope.CONTROL],
+        if_match=if_match,
+        acknowledgement=acknowledgement,
+        timestamp=service.store.now_micros(),
+    )
 
 
 class CountingWorker:
@@ -120,21 +140,22 @@ def test_restart_requires_worker_fence_and_acknowledgement(tmp_path, attempt_sta
             revision = await service.store.current_revision()
 
             with pytest.raises(StateConflictError, match="authority has not ended"):
-                await service.acknowledge_recovery(
-                    principal="operator",
-                    scopes=[AuthorizationScope.CONTROL],
-                    if_match=queue_etag(revision),
-                    acknowledgement=RecoveryAcknowledgement(note="investigated"),
+                await acknowledge_recovery(
+                    service,
+                    revision=revision,
+                    note="investigated",
+                    key=f"recovery-held-{attempt_state.value}",
                 )
             assert replacement.start_count == 0
 
             old_lock.release()
-            revision = await service.acknowledge_recovery(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(revision),
-                acknowledgement=RecoveryAcknowledgement(note="old worker lock released"),
+            await acknowledge_recovery(
+                service,
+                revision=revision,
+                note="old worker lock released",
+                key=f"recovery-released-{attempt_state.value}",
             )
+            revision = await service.store.current_revision()
             assert revision > 0
             assert replacement.start_count == 1
             assert service.dispatch_ready
@@ -186,25 +207,20 @@ def test_graceful_shutdown_commits_interrupted_after_worker_fence(tmp_path):
         )
         service = ControllerService(store, worker=gateway)
         await service.open()
-        await service.acquire_control_lease(
+        await store.acquire_control_lease(principal="operator")
+        operation, revision = await store.submit_operation(
             principal="operator",
-            scopes=[AuthorizationScope.CONTROL],
+            expected_revision=0,
+            descriptor=SIMULATED_COUNT_DESCRIPTOR,
+            operation_id="simulated-count",
+            operation_version="1",
+            parameters={"detectors": ["det"], "num": 10, "delay": 0.2},
         )
-        operation, revision = await service.submit_operation(
+        await store.start_queue_execution(
             principal="operator",
-            scopes=[AuthorizationScope.CONTROL],
-            if_match=queue_etag(0),
-            submission=OperationSubmission(
-                operation_id="simulated-count",
-                operation_version="1",
-                parameters={"detectors": ["det"], "num": 10, "delay": 0.2},
-            ),
+            expected_revision=revision,
         )
-        await service.start_queue_execution(
-            principal="operator",
-            scopes=[AuthorizationScope.CONTROL],
-            if_match=queue_etag(revision),
-        )
+        service.wake_scheduler()
         await wait_for_operation_state(store, operation.operation_uid, OperationState.RUNNING)
         attempt = await store.get_active_attempt()
         assert attempt is not None
@@ -282,11 +298,11 @@ def test_clean_failure_requires_acknowledgement_but_not_fence_evidence(tmp_path)
             assert not block.requires_fence
             assert replacement.start_count == 0
             revision = await service.store.current_revision()
-            await service.acknowledge_recovery(
-                principal="operator",
-                scopes=[AuthorizationScope.CONTROL],
-                if_match=queue_etag(revision),
-                acknowledgement=RecoveryAcknowledgement(note="failure reviewed"),
+            await acknowledge_recovery(
+                service,
+                revision=revision,
+                note="failure reviewed",
+                key="recovery-clean-failure",
             )
             assert replacement.start_count == 1
             assert (
