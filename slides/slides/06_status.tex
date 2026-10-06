@@ -142,18 +142,20 @@
 
 % ----------------------------------------------------------
 \begin{frame}{Questions I would like this group to answer}
-    \large
+    \normalsize
     \begin{enumerate}
-        \setlength{\itemsep}{0.35cm}
+        \setlength{\itemsep}{0.25cm}
         \item Which of the eight properties do you disagree with, and why?
         \item Which 0.x capability did I drop that you would fight to keep
               (interactive kernel, script upload, function execution, loop mode, \ldots)?
         \item Is ``catalog, not namespace'' workable for the beamlines you support?
               Which workflow would you pilot first?
         \item Where is the failure matrix wrong? What incident would it have handled badly?
+        \item We intend to expose this service on the internet behind facility SSO.
+              Which of the 0.x assumptions on the security slide would you be comfortable keeping there?
         \item If \vtwo{} proceeds, what is the right maintenance policy for 0.x?
     \end{enumerate}
-    \vspace{0.6cm}
+    \vspace{0.4cm}
     \begin{center}
         {\normalsize\color{qsgray} Code: \code{src/bluesky\_queueserver/v2/} \quad
         Tests: \code{src/bluesky\_queueserver/tests/v2/} \quad

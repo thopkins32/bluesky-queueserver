@@ -1,0 +1,194 @@
+% ==========================================================
+% SECURITY WHEN THE DOOR FACES THE INTERNET
+% ==========================================================
+
+\divider{When the door faces the internet}{the same eight properties, read as a security posture}
+
+% ----------------------------------------------------------
+\begin{frame}{Threat model for an internet-facing queue server}
+    \framesubtitle{Authentication is NSLS-II's and BNL's job. Everything after the token is ours.}
+    \begin{columns}[T]
+        \begin{column}{0.48\textwidth}
+            \scriptsize
+            \textbf{What is behind the door}
+            \begin{itemize}
+                \item Motors, shutters, detectors: physical actions on a live instrument
+                \item Beamtime: a stopped or corrupted queue is lost shifts
+                \item Data integrity and provenance of what was collected and why
+                \item The identities of staff and users, and the facility network behind the host
+            \end{itemize}
+            \vspace{0.15cm}
+            \textbf{Who is on the other side}
+            \begin{itemize}
+                \item Anyone on the internet, before authentication
+                \item A real user with phished or leaked credentials, or a compromised laptop
+                \item An authenticated user doing something they are not supposed to be able to do
+                \item A compromised intermediate host (proxy, HTTP server) on the facility network
+                \item Automation and agents holding long-lived credentials
+            \end{itemize}
+        \end{column}
+        \begin{column}{0.5\textwidth}
+            \begin{block}{What must therefore hold}
+                \scriptsize
+                \begin{enumerate}
+                    \item \textbf{One door.} Every control path authenticates; no second path that trusts the network.
+                    \item \textbf{Identity from the identity provider}, verified by the service, never minted by it,
+                          never supplied in a request.
+                    \item \textbf{Least privilege per action}, decided server-side.
+                    \item \textbf{No path from a request to code execution.} The remotely reachable surface is
+                          reviewable and finite.
+                    \item \textbf{Replay- and retry-safe mutations.}
+                    \item \textbf{Non-repudiable audit}: who, what, when, in order.
+                    \item \textbf{Safe under loss}: disconnects, timeouts and crashes end in a known state, not a guess.
+                    \item \textbf{Bounded blast radius}: compromise of one component does not hand over the instrument.
+                \end{enumerate}
+            \end{block}
+            {\footnotesize\color{qsgray} These are properties 1--8 again, with an adversary instead of a bug.\par}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{\legacy{}, read from the code: designed for a trusted network}
+    \framesubtitle{Reasonable assumptions on a hutch LAN behind a VPN; each becomes an exposure on the internet}
+    \begin{columns}[T]
+        \begin{column}{0.34\textwidth}
+            \begin{exampleblock}{What is already strong}
+                \scriptsize
+                \begin{itemize}
+                    \item \code{bluesky-httpserver} has a serious authentication stack: OIDC, proxied OIDC,
+                          Entra, SAML, LDAP, PAM; hashed API keys; refresh sessions; device-code flow.
+                          \src{authenticators.py; authentication.py:259-307}
+                    \item 25 fine-grained scopes mapped from roles; principal $\to$ resource group for plan/device
+                          allow-lists. \src{authorization/\_defaults.py}
+                    \item Token secrets support rotation. \src{authentication.py: decode\_token}
+                    \item Per-group plan and device allow/deny lists at the manager.
+                          \src{profile\_ops.py:3736-3852}
+                \end{itemize}
+            \end{exampleblock}
+        \end{column}
+        \begin{column}{0.64\textwidth}
+            \begin{alertblock}{Assumptions that do not survive exposure}
+                \scriptsize
+                \begin{itemize}
+                    \item \textbf{Two doors.} The manager's 0MQ port accepts \code{\{method, params\}} with
+                          \code{user}/\code{user\_group} asserted by the caller; identity is exactly as strong
+                          as the network ACL on port 60615. \src{manager.py:3759-3770, 2209-2222}
+                    \item \textbf{CURVE encrypts, it does not authenticate.} The client key pair is fixed and
+                          public. \src{comms.py:18-19; manager\_config.rst:34-38}
+                    \item \textbf{The HTTP server is a token issuer.} It mints HS256 access and refresh tokens
+                          from secrets it holds; a leaked secret forges any identity with any scope.
+                          \src{authentication.py:71, create\_access\_token}
+                    \item \textbf{Code execution is a feature.} \code{write:scripts} runs arbitrary Python in the
+                          worker; \code{write:execute} calls allowed functions and is in the \emph{default}
+                          \code{user} role. \src{core\_api.py:824-855; \_defaults.py}
+                    \item \textbf{Plan arguments are a dynamic surface.} Strings resolve to namespace objects by
+                          attribute path; safety depends on every beamline's allow-lists. \src{profile\_ops.py:785-830}
+                    \item \textbf{Authorization is opt-in per route.} \code{GET /plans/existing} has no principal
+                          dependency and answers unauthenticated. \src{core\_api.py:740-743}
+                    \item \textbf{Compromise of the HTTP host is compromise of the instrument}: the
+                          manager behind it trusts whatever that host says.
+                \end{itemize}
+            \end{alertblock}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{\vtwo{} posture, and what it does \emph{not} protect against}
+    \begin{columns}[T]
+        \begin{column}{0.5\textwidth}
+            \begin{block}{Enforced today}
+                \scriptsize
+                \begin{itemize}
+                    \item \textbf{One door.} HTTPS only; TLS files required at startup. No 0MQ, no second
+                          control path; the worker is reachable only through a socketpair FD it inherits.
+                    \item \textbf{No signing secret on the server.} Tokens are verified against the identity
+                          provider's JWKS (RS256; \code{iss}, \code{aud}, \code{exp}, \code{iat}, \code{nbf}; 30\,s skew).
+                          The controller cannot mint an identity. \src{v2/auth.py:52-92}
+                    \item \textbf{Principal from the token only.} Bodies naming an actor are rejected.
+                    \item \textbf{No request $\to$ code path.} No names, object paths, scripts or functions;
+                          closed schemas (\code{additionalProperties: false}) validated on both sides. The tests
+                          assert no \code{zmq}/\code{script}/\code{function}/\code{namespace}/\code{plan} route
+                          exists. \src{tests/v2/test\_web\_api.py:284-288}
+                    \item \textbf{Mutations need lease + revision + \code{Idempotency-Key}}; replays safe, conflicts 409.
+                    \item \textbf{Audit:} every mutation records the principal; every response carries
+                          \code{X-Request-ID}; events are append-only.
+                    \item \textbf{No remote deployment levers:} no environment open/update/destroy, no package
+                          or profile changes via the API; worker command from config, launched without a shell.
+                    \item Lock files are \code{0600} and owner/mode checked; database on a local filesystem only;
+                          \code{/health} and \code{/ready} expose no principals, PIDs or paths.
+                \end{itemize}
+            \end{block}
+        \end{column}
+        \begin{column}{0.48\textwidth}
+            \begin{alertblock}{Not addressed; needs deployment or future work}
+                \scriptsize
+                \begin{itemize}
+                    \item \textbf{No token revocation.} A bearer token is valid until \code{exp}. Mitigation:
+                          short IdP token lifetimes; the lease TTL bounds mutation and SSE closes at expiry.
+                    \item \textbf{No rate limiting or DoS protection.} Put a reverse proxy / WAF in front;
+                          the controller is one asyncio process.
+                    \item \textbf{The worker is not a sandbox.} Same OS user as the controller; profile and
+                          adapter code are fully trusted. Containment is an OS/deployment matter.
+                    \item \textbf{Authorization is per operation, not per experiment.} Any \code{control}
+                          holder may run any catalogued operation; no proposal or resource-group model yet.
+                    \item \textbf{Per-route authorization is still opt-in} in FastAPI; a missed dependency
+                          would be the same class of bug as \code{/plans/existing}. Tests and review guard it.
+                    \item \textbf{Identity-provider dependency.} JWKS is fetched and cached; an IdP outage blocks
+                          new authentication (admitted work continues).
+                    \item \textbf{Not yet reviewed by anyone but me.} A facility security review is needed.
+                \end{itemize}
+            \end{alertblock}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{Deployment shape for exposure}
+    \begin{columns}[T]
+        \begin{column}{0.56\textwidth}
+            \begin{center}
+            \begin{tikzpicture}[node distance=0.5cm and 0.6cm, scale=0.8, transform shape]
+                \node[ext] (user) {Browser / agent\\\tiny anywhere};
+                \node[ext, right=1.6cm of user] (idp) {BNL / NSLS-II SSO\\\tiny issues RS256 JWT};
+                \node[box, below=0.9cm of user, draw=qsgray] (proxy) {Reverse proxy / WAF\\\tiny TLS, rate limits, logging};
+                \node[box, below=0.8cm of proxy] (ctl) {Controller\\\tiny verifies JWT via JWKS, lease, revision, audit};
+                \node[store, right=0.9cm of ctl] (db) {SQLite\\\tiny local disk, owner-only};
+                \node[box, below=0.8cm of ctl] (wrk) {Worker\\\tiny socketpair only, no listening port};
+                \node[ext, below=0.5cm of wrk] (ioc) {IOCs / interlocks\\\tiny unchanged};
+                \draw[arrow, dashed, qsgray] (user) -- node[lbl, above] {login} (idp);
+                \draw[arrow, dashed, qsgray] (ctl.east) to[bend right=35] node[lbl, right, align=left] {JWKS\\(outbound only)} (idp.south);
+                \draw[arrow] (user) -- node[lbl, right] {HTTPS, bearer JWT} (proxy);
+                \draw[arrow] (proxy) -- node[lbl, right] {HTTPS} (ctl);
+                \draw[both, qsnavy] (ctl) -- (db);
+                \draw[both, qsnavy] (ctl) -- node[lbl, right] {inherited FD} (wrk);
+                \draw[arrow] (wrk) -- (ioc);
+                \begin{scope}[on background layer]
+                    \node[fill=qslight, rounded corners=4pt, fit=(ctl)(db)(wrk)(ioc), inner sep=6pt, label={[font=\tiny, text=qsgray]below:beamline host / controls network}] {};
+                \end{scope}
+            \end{tikzpicture}
+            \end{center}
+        \end{column}
+        \begin{column}{0.42\textwidth}
+            \footnotesize
+            \textbf{What the picture buys}
+            \begin{itemize}
+                \item Exactly one inbound port on the beamline host: the controller's HTTPS.
+                \item The host holds no identity-issuing secret; stealing the box does not forge users.
+                \item Compromising the proxy yields HTTP requests that still need a valid JWT, a lease and the
+                      current revision, and can still reach only catalogued operations.
+                \item The worker has no network surface; its authority is bounded by the reviewed catalog
+                      and ends with its lock.
+                \item Everything that happened is in one append-only table on one disk.
+            \end{itemize}
+            \vspace{0.05cm}
+            \textbf{What it does not buy}
+            \begin{itemize}
+                \item Protection from a legitimately authorized user doing a legitimate but harmful operation.
+                      That is what reviewed operations, bounded parameters and interlocks are for.
+                \item Anything the IdP gets wrong.
+            \end{itemize}
+        \end{column}
+    \end{columns}
+\end{frame}
