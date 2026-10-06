@@ -8,9 +8,9 @@
             \footnotesize
             \textbf{What I did}
             \begin{itemize}
-                \item Wrote a second-generation queue server, in-tree, next to \legacy{}:
+                \item Wrote a second-generation queue server next to \legacy{}:
                       \code{bluesky\_queueserver.v2}
-                \item Kept the shape you designed: one controller, one Bluesky worker process,
+                \item Kept the shape already designed: one controller, one Bluesky worker process,
                       an editable persistent queue
                 \item Changed the \emph{contracts}: identity, operation surface, concurrency,
                       failure handling, recovery
@@ -21,14 +21,14 @@
                 \item Agreement, or disagreement, on a short list of properties
                       I think \emph{any} Bluesky queue server needs
                 \item Technical review of \vtwo{} as a candidate for the next major version
-                \item Not a decision. Nothing shown here is approved for hardware.
+                \item Not a decision. Nothing shown here is ready to use in production yet.
             \end{itemize}
         \end{column}
         \begin{column}{0.44\textwidth}
             \begin{block}{Ground rules I set for myself}
                 \footnotesize
                 \begin{itemize}
-                    \item Compare mechanisms, not people. Every \legacy{} statement
+                    \item Compare mechanisms. Every \legacy{} statement
                           cites a file and line in \code{manager/}, \code{bluesky-httpserver} or
                           \code{bluesky-queueserver-api}.
                     \item Where \legacy{} already does the right thing, say so.
@@ -47,7 +47,7 @@
 \begin{frame}{What \legacy{} got right -- and \vtwo{} keeps}
     \begin{columns}[T]
         \begin{column}{0.5\textwidth}
-            \begin{exampleblock}{Load-bearing ideas}
+            \begin{exampleblock}{Core ideas}
                 \footnotesize
                 \begin{itemize}
                     \item \textbf{Manager / worker split.} Bluesky and Ophyd run in a separate process
