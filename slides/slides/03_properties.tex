@@ -1,0 +1,349 @@
+% ==========================================================
+% EIGHT PROPERTIES
+% ==========================================================
+
+\divider{Eight properties}{that I believe any Bluesky queue server needs, whichever codebase provides them}
+
+% ----------------------------------------------------------
+\begin{frame}{1 \quad Identity is established by the server; rights are scopes}
+    {\footnotesize\itshape Why: the actor on an audit record must be something the server proved, not something
+    the client typed. Staff, users and autonomous agents need different rights.}
+    \vspace{0.05cm}
+    \begin{columns}[T]
+        \begin{column}{0.49\textwidth}
+            \begin{alertblock}{\legacy{} today}
+                \footnotesize
+                \begin{itemize}
+                    \item \code{bluesky-httpserver} does this well at the HTTP edge: API keys, access/refresh
+                          tokens, OIDC/LDAP/PAM/SAML, roles $\rightarrow$ scopes such as
+                          \code{write:queue:edit}. \src{authentication.py:259-307; core\_api.py:189-221}
+                    \item It then forwards \code{\{"user": name, "user\_group": group\}} as plain fields
+                          over 0MQ. \src{core\_api.py:201-212}
+                    \item The manager trusts those fields; it checks only that the group exists.
+                          \src{manager.py:2209-2222}
+                    \item 0MQ CURVE uses one fixed client key pair, so the transport does not identify callers either.
+                          \src{comms.py:18-19; manager\_config.rst:34-38}
+                \end{itemize}
+            \end{alertblock}
+        \end{column}
+        \begin{column}{0.49\textwidth}
+            \begin{block}{\vtwo{}}
+                \footnotesize
+                \begin{itemize}
+                    \item One process owns the public boundary; there is no second, unauthenticated control path.
+                    \item OIDC bearer JWT, RS256, issuer/audience/JWKS verified; the principal is the \code{sub} claim.
+                          \src{v2/auth.py:52-92}
+                    \item Three fixed scopes: \code{queueserver:read} $\subset$ \code{control} $\subset$ \code{admin}.
+                    \item Every durable mutation stores that principal; a body that tries to name an actor is rejected (422).
+                    \item Only \code{/health} and \code{/ready} are unauthenticated, and they expose no principals or PIDs.
+                \end{itemize}
+            \end{block}
+        \end{column}
+    \end{columns}
+    \vspace{0.1cm}
+    {\footnotesize\color{qsgray} Demo: \code{qsv2 --as forged queue} $\rightarrow$ 401;\quad
+    \code{qsv2 --as viewer submit} $\rightarrow$ 403 \code{scope 'queueserver:control' is required}.\par}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{2 \quad A closed, versioned operation catalog, not a namespace}
+    {\footnotesize\itshape Why: the remote contract should be reviewable without reading the worker's globals,
+    and a change in meaning should be a visible version change.}
+    \vspace{0.05cm}
+    \begin{columns}[T]
+        \begin{column}{0.49\textwidth}
+            \begin{alertblock}{\legacy{} today}
+                \footnotesize
+                \begin{itemize}
+                    \item A queue item is \code{\{"name": plan, "args", "kwargs"\}}; the worker resolves
+                          the name and converts strings such as \code{"det.a"} by repeated \code{getattr}.
+                          \src{profile\_ops.py:785-830, 993-1048}
+                    \item \code{function\_execute} runs any allowed callable;
+                          \code{script\_upload} \code{exec}s a client string in the namespace.
+                          \src{manager.py:2954-3037; worker.py:815-889}
+                    \item \code{existing\_plans\_and\_devices.yaml} + \code{user\_group\_permissions.yaml}
+                          (regex allow/deny) narrow what is reachable. \src{profile\_ops.py:3736-3852}
+                    \item Annotations give parameter types, but semantics are whatever the plan does today.
+                \end{itemize}
+            \end{alertblock}
+        \end{column}
+        \begin{column}{0.49\textwidth}
+            \begin{block}{\vtwo{}}
+                \footnotesize
+                \begin{itemize}
+                    \item A submission is \code{(operation\_id, operation\_version, parameters)}.
+                    \item The worker publishes descriptors at startup: request and result JSON Schema,
+                          required scope, orphan policy. \src{v2/contracts.py:195-224}
+                    \item Controller and worker both validate; anything not in the catalog is refused
+                          before persistence.
+                    \item \code{worker\_revision} = SHA-256 over package, protocol, descriptors, Bluesky/Ophyd
+                          versions, environment lock, startup and adapter sources. \src{v2/worker/sdk.py:192-207}
+                    \item No plan names, no object paths, no scripts, no \code{execute\_plan}.
+                \end{itemize}
+            \end{block}
+        \end{column}
+    \end{columns}
+    \vspace{0.1cm}
+    {\footnotesize\color{qsgray} Demo: \code{num: 11} $\rightarrow$ 422 with the schema path;\quad
+    \code{operation\_id: execute\_plan} $\rightarrow$ 422 \code{not in the worker catalog}.\par}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{3 \quad Control is a lease on an identity; scheduling is separate authority}
+    {\footnotesize\itshape Why: ``who may change the queue right now'' must be unambiguous, and a closed laptop
+    must not end an overnight batch.}
+    \vspace{0.05cm}
+    \begin{columns}[T]
+        \begin{column}{0.49\textwidth}
+            \begin{alertblock}{\legacy{} today}
+                \footnotesize
+                \begin{itemize}
+                    \item \code{lock} stores a client-chosen \code{lock\_key} plus a \code{user} string;
+                          any caller presenting the key may act. \src{manager.py:3458-3490}
+                    \item \code{unlock} takes only the key; the emergency key is a deployment secret.
+                          \src{manager.py:3560-3575}
+                    \item \code{queue\_start} flips manager state; \code{queue\_autostart} loops every 1\,s
+                          while the queue is non-empty. \src{manager.py:1256-1282}
+                    \item The manager keeps running the queue without a client -- the right behaviour,
+                          and \vtwo{} keeps it.
+                \end{itemize}
+            \end{alertblock}
+        \end{column}
+        \begin{column}{0.49\textwidth}
+            \begin{block}{\vtwo{}}
+                \footnotesize
+                \begin{itemize}
+                    \item A \textbf{control lease}: one authenticated principal, TTL 5\,s--1\,h,
+                          renew/release, admin override with a recorded reason.
+                    \item Submitting, cancelling, replacing, reordering, start/stop and recovery
+                          all require \emph{your} active lease.
+                    \item Starting a \textbf{queue execution} durably records initiator, policy and the
+                          admitted operations. That record, not the lease, authorizes the scheduler.
+                    \item Admitted work continues after disconnect or lease expiry; lease expiry only
+                          blocks \emph{new} external edits. \src{tests/v2/test\_scheduler.py:429-540}
+                    \item Pending work is editable; claimed and running work is immutable.
+                \end{itemize}
+            \end{block}
+        \end{column}
+    \end{columns}
+    \vspace{0.1cm}
+    {\footnotesize\color{qsgray} Demo: \code{qsv2 --as admin submit} while \code{operator} holds the lease $\rightarrow$ 403
+    \code{control lease belongs to another principal}.\par}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{4 \quad Optimistic concurrency on the queue}
+    {\footnotesize\itshape Why: a GUI, an agent and the scheduler all edit the same queue. ``Move item 3 up''
+    must fail if the queue changed underneath you.}
+    \vspace{0.05cm}
+    \begin{columns}[T]
+        \begin{column}{0.49\textwidth}
+            \begin{alertblock}{\legacy{} today}
+                \footnotesize
+                \begin{itemize}
+                    \item \code{plan\_queue\_uid} and \code{plan\_history\_uid} change on every mutation and
+                          let clients avoid reloading.
+                    \item They are documented as monitoring aids that ``may not represent a valid queue
+                          state''. \src{plan\_queue\_ops.py:140-148}
+                    \item \code{queue\_item\_add/update/move/remove} take no expected version;
+                          the last writer wins. \src{manager.py:2379, 2476, 2553}
+                    \item Every add assigns a fresh \code{item\_uid}, so an item has no stable identity
+                          across a failed run. \src{manager.py:2390-2394}
+                \end{itemize}
+            \end{alertblock}
+        \end{column}
+        \begin{column}{0.49\textwidth}
+            \begin{block}{\vtwo{}}
+                \footnotesize
+                \begin{itemize}
+                    \item One monotonic \code{queue\_revision}; every queue response carries
+                          \code{ETag: "qrev-N"}.
+                    \item Every queue mutation requires \code{If-Match}: 428 if missing, 412 with the
+                          current ETag if stale, no partial write.
+                    \item Scheduler claims, completions and edits bump the \emph{same} revision in the same
+                          SQLite transaction, so an edit racing a claim loses deterministically.
+                          \src{v2/storage.py:2921-2946}
+                    \item An operation keeps one UID from submission to terminal state; a replacement is a
+                          new UID linked by \code{replaced\_by}.
+                \end{itemize}
+            \end{block}
+        \end{column}
+    \end{columns}
+    \vspace{0.1cm}
+    {\footnotesize\color{qsgray} Demo: \code{qsv2 --stale submit} $\rightarrow$ 412
+    \code{queue revision 0 is stale; current revision is 2}, \code{ETag: "qrev-2"}.\par}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{5 \quad Durable transactional state, an append-only audit log, push not poll}
+    {\footnotesize\itshape Why: after a restart you must be able to say exactly what happened, in what order,
+    and who asked for it. Clients should not have to guess by polling.}
+    \vspace{0.05cm}
+    \begin{columns}[T]
+        \begin{column}{0.49\textwidth}
+            \begin{alertblock}{\legacy{} today}
+                \footnotesize
+                \begin{itemize}
+                    \item Redis lists and strings: \code{plan\_queue}, \code{running\_plan},
+                          \code{plan\_history}, \code{plan\_queue\_mode}, \code{lock\_info}, \ldots{}
+                          Survives a manager restart. \src{plan\_queue\_ops.py:85-96}
+                    \item History holds each completed item with its result; there is no per-mutation
+                          record of \emph{who} changed the queue.
+                    \item Status is polled (default 1\,s); console output streams over PUB/SUB and
+                          websockets. \src{api\_threads.py:66-149; core\_api.py:1123-1289}
+                    \item Multi-key updates are not transactional across keys.
+                \end{itemize}
+            \end{alertblock}
+        \end{column}
+        \begin{column}{0.49\textwidth}
+            \begin{block}{\vtwo{}}
+                \footnotesize
+                \begin{itemize}
+                    \item SQLite, WAL, \code{synchronous=FULL}, foreign keys, application id \code{QSV2},
+                          local disk only (NFS/CIFS/SSHFS/\ldots{} refused). \src{v2/storage.py:38-56, 728-751}
+                    \item One \code{BEGIN IMMEDIATE} transaction writes the domain change, the revision,
+                          the actor and an event. \src{v2/storage.py:3062-3088}
+                    \item Events have monotonic ids: \code{GET /events?after=N} and SSE with
+                          \code{Last-Event-ID} resume without gaps; 15\,s heartbeat comment.
+                    \item Controller events and Bluesky documents are separate planes; the controller keeps
+                          only run UIDs for correlation.
+                    \item Schema migrations, backup with manifest, verified restore, admin CLI.
+                \end{itemize}
+            \end{block}
+        \end{column}
+    \end{columns}
+    \vspace{0.1cm}
+    {\footnotesize\color{qsgray} Demo: \code{qsv2 stream} shows every transition with actor and revision;
+    restart the controller and replay from \code{after=0}.\par}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{6 \quad Fail closed when an outcome cannot be proven}
+    {\footnotesize\itshape Why: at a beamline, ``I do not know what the hardware did'' must never be rounded to
+    ``failed, try again''.}
+    \vspace{0.05cm}
+    \begin{columns}[T]
+        \begin{column}{0.49\textwidth}
+            \begin{alertblock}{\legacy{} today}
+                \footnotesize
+                \begin{itemize}
+                    \item A plan exception yields a \code{failed} report with run UIDs.
+                          \src{worker.py:357-389}
+                    \item Failed, aborted and halted items are appended to history \emph{and pushed back to the
+                          front of the queue} with a new UID. \src{plan\_queue\_ops.py:1823-1859}
+                    \item \code{ignore\_failures} mode continues to the next item. \src{manager.py:831-845}
+                    \item \code{environment\_destroy} records the running item as failed.
+                          \src{manager.py:657-686}
+                    \item On a hard worker death the status poll returns \code{None} and only the
+                          \code{ws is not None} branch is handled. \src{manager.py:741-760, 1544-1550}
+                          I could not find a path that records the outcome.
+                \end{itemize}
+            \end{alertblock}
+        \end{column}
+        \begin{column}{0.49\textwidth}
+            \begin{block}{\vtwo{}}
+                \footnotesize
+                \begin{itemize}
+                    \item A claim writes a durable \textbf{attempt} (operation, worker instance, message id,
+                          actor, revision, event) \emph{before} the worker is contacted.
+                          \src{v2/controller.py:757-803}
+                    \item Timeout, EOF, process exit, malformed frame, wrong correlation, invalid result
+                          $\rightarrow$ \code{unknown}. Shutdown mid-attempt $\rightarrow$ \code{interrupted}.
+                          Worker: RunEngine not idle or cleanup incomplete $\rightarrow$ \code{unknown}.
+                          \src{v2/worker/runtime.py:391-430}
+                    \item Any non-success blocks dispatch and stops the queue execution. Nothing is retried,
+                          requeued or inferred. \src{tests/v2/test\_scheduler.py:549-604}
+                    \item Retries never overwrite earlier evidence: a new attempt is a new row.
+                \end{itemize}
+            \end{block}
+        \end{column}
+    \end{columns}
+    \vspace{0.1cm}
+    {\footnotesize\color{qsgray} Demo: \code{qsv2 kill-worker} mid-plan $\rightarrow$ \code{operation.unknown}
+    \code{\{cleanup\_completed: false\}}, \code{dispatch.blocked}, \code{/ready} $\rightarrow$ 503.\par}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{7 \quad Explicit recovery, fenced worker authority}
+    {\footnotesize\itshape Why: two processes must never both believe they own the RunEngine. Recovery is a human
+    decision and should leave a record.}
+    \vspace{0.05cm}
+    \begin{columns}[T]
+        \begin{column}{0.49\textwidth}
+            \begin{alertblock}{\legacy{} today}
+                \footnotesize
+                \begin{itemize}
+                    \item Watchdog restarts the manager after a 5--15\,s heartbeat gap.
+                          \src{start\_manager.py:69, 217-221}
+                    \item The new manager asks the watchdog if the worker is alive and
+                          \emph{reconstructs} state from the worker's report: executing, paused, or
+                          \code{exit\_status="unknown"}. \src{manager.py:3882-3928, 3948-3956}
+                    \item Powerful and convenient; also the point where two views of the truth are
+                          reconciled by inference, with no operator in the loop.
+                    \item Worker restart is an API call (\code{environment\_open}) available to any
+                          caller with the right scope.
+                \end{itemize}
+            \end{alertblock}
+        \end{column}
+        \begin{column}{0.49\textwidth}
+            \begin{block}{\vtwo{}}
+                \footnotesize
+                \begin{itemize}
+                    \item Controller lock and worker lock: \code{flock}, owner and mode checked, no symlinks.
+                          The worker holds its lock until RunEngine cleanup and exit.
+                          \src{v2/controller.py:86-126; v2/worker/runtime.py:44-75, 139-175}
+                    \item \code{unknown}/\code{interrupted} require \textbf{fence evidence}: a successful exclusive
+                          lock probe, recorded as \code{worker.fenced}. A PID is not evidence.
+                    \item Recovery is \code{POST /recovery/acknowledge} with lease, revision and a note;
+                          it fails with \code{prior worker authority has not ended} until fenced.
+                    \item No reattachment to a surviving worker. On controller loss the worker requests a
+                          RunEngine pause and exits (\code{request-stop}). \src{v2/worker/runtime.py:214-239}
+                    \item Remaining queued work is \emph{not} resumed; a new execution must be started.
+                \end{itemize}
+            \end{block}
+        \end{column}
+    \end{columns}
+    \vspace{0.1cm}
+    {\footnotesize\color{qsgray} Demo: \code{qsv2 ack --note "..."} $\rightarrow$ 200, \code{/ready} $\rightarrow$ 200,
+    execution state \code{stopped}, next item still \code{queued}.\par}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{8 \quad Idempotent mutations and honest readiness}
+    {\footnotesize\itshape Why: a retried request over hutch Wi-Fi must not submit twice. A supervisor needs to know
+    which component is not ready, not just that the port answers.}
+    \vspace{0.05cm}
+    \begin{columns}[T]
+        \begin{column}{0.49\textwidth}
+            \begin{alertblock}{\legacy{} today}
+                \footnotesize
+                \begin{itemize}
+                    \item Each call is one 0MQ REQ/REP exchange; a client that times out and resends
+                          \code{queue\_item\_add} adds twice.
+                    \item \code{status} reports \code{manager\_state}, \code{worker\_environment\_exists},
+                          \code{re\_state}, queue/history UIDs. \src{manager.py:410-448}
+                          Rich, but every client interprets the combination itself.
+                    \item Health of Redis, watchdog and the 0MQ socket are not distinguished at the API.
+                \end{itemize}
+            \end{alertblock}
+        \end{column}
+        \begin{column}{0.49\textwidth}
+            \begin{block}{\vtwo{}}
+                \footnotesize
+                \begin{itemize}
+                    \item \code{Idempotency-Key} is required on every mutation, scoped to
+                          (principal, method, path). Exact replay returns the stored status, body and ETag;
+                          same key with a different body $\rightarrow$ 409. \src{v2/storage.py:2862-2917}
+                    \item \code{/health}: the process answers. \code{/ready}: 200 only when controller lock,
+                          storage, worker, fencing and dispatch are all ready; otherwise 503 with those five
+                          coarse fields and nothing else.
+                    \item Every response carries \code{X-Request-ID}; every error is
+                          \code{\{code, message, details, request\_id\}}.
+                \end{itemize}
+            \end{block}
+        \end{column}
+    \end{columns}
+    \vspace{0.1cm}
+    {\footnotesize\color{qsgray} Demo: \code{qsv2 --key demo-renew lease renew} twice $\rightarrow$ 200, 200 (same body);
+    then with \code{--ttl 900} $\rightarrow$ 409 \code{idempotency\_conflict}.\par}
+\end{frame}

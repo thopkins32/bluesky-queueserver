@@ -1,0 +1,222 @@
+\documentclass[aspectratio=169,9pt,t]{beamer}
+
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, decorations.pathreplacing}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{tabularx}
+
+% Remove navigation symbols
+\usepackage{etoolbox}
+\apptocmd{\itemize}{\setlength{\itemsep}{1.5pt}\setlength{\topsep}{1pt}}{}{}
+\apptocmd{\enumerate}{\setlength{\itemsep}{2pt}\setlength{\topsep}{1pt}}{}{}
+\setbeamertemplate{navigation symbols}{}
+
+% ---------- Slide counter (frame number / total) ----------
+\setbeamertemplate{footline}{
+    \vbox to 0.75cm{\vfil\hbox to \paperwidth{\hfill\insertframenumber~/~\inserttotalframenumber\hspace{4pt}}\vspace{3pt}}
+}
+
+% ---------- Custom title page (shifted down, black text, bigger title) ----------
+\setbeamertemplate{title page}{
+    \vspace{2.5cm}
+    \begin{center}
+        {\color{black}\Huge\bfseries\inserttitle}\\[0.5cm]
+        {\color{black}\normalsize\insertauthor}\\[0.2cm]
+        {\color{black}\small\insertinstitute}\\[0.2cm]
+        {\color{black}\small\insertdate}
+    \end{center}
+}
+
+% ---------- Slide title shifted down and to the right ----------
+\makeatletter
+\setbeamertemplate{frametitle}{
+    \vspace{0.4cm}
+    \hspace{0.1cm}\insertframetitle
+    \ifx\insertframesubtitle\@empty\else
+        \par\vspace{0.05cm}\hspace{0.1cm}{\normalfont\small\itshape\color{qsgray}\insertframesubtitle}
+    \fi
+}
+\makeatother
+
+% ---------- Code listing styles ----------
+\definecolor{codebg}{RGB}{245,245,245}
+\definecolor{codegreen}{RGB}{0,128,0}
+\definecolor{codepurple}{RGB}{128,0,128}
+\definecolor{codeblue}{RGB}{0,0,180}
+\definecolor{codeorange}{RGB}{204,102,0}
+
+\lstset{
+    basicstyle=\ttfamily\tiny,
+    backgroundcolor=\color{codebg},
+    frame=single,
+    framerule=0.5pt,
+    rulecolor=\color{gray},
+    breaklines=true,
+    breakatwhitespace=true,
+    showstringspaces=false,
+    tabsize=4,
+    captionpos=b,
+    xleftmargin=2pt,
+    xrightmargin=2pt,
+    aboveskip=4pt,
+    belowskip=4pt,
+}
+
+\lstdefinestyle{bash}{
+    language=bash,
+    keywordstyle=\color{codeblue}\bfseries,
+    stringstyle=\color{codegreen},
+    commentstyle=\color{gray}\itshape,
+    morekeywords={cd,git,clone,make,mkdir,curl,pixi,find,mv,ls},
+}
+
+\lstdefinestyle{python}{
+    language=Python,
+    keywordstyle=\color{codeblue}\bfseries,
+    stringstyle=\color{codegreen},
+    commentstyle=\color{gray}\itshape,
+    emphstyle=\color{codepurple},
+}
+
+\lstdefinestyle{json}{
+    language=,
+    stringstyle=\color{codegreen},
+    morestring=[b]",
+    literate=
+        *{0}{{{\color{codeorange}0}}}{1} {1}{{{\color{codeorange}1}}}{1}
+         {2}{{{\color{codeorange}2}}}{1} {3}{{{\color{codeorange}3}}}{1}
+         {4}{{{\color{codeorange}4}}}{1} {5}{{{\color{codeorange}5}}}{1}
+         {6}{{{\color{codeorange}6}}}{1} {7}{{{\color{codeorange}7}}}{1}
+         {8}{{{\color{codeorange}8}}}{1} {9}{{{\color{codeorange}9}}}{1},
+}
+
+\lstdefinestyle{http}{
+    language=,
+    basicstyle=\ttfamily\scriptsize,
+    commentstyle=\color{gray}\itshape,
+    morecomment=[l]{\#},
+}
+
+% ---------- Palette ----------
+\definecolor{qsnavy}{RGB}{0,51,102}
+\definecolor{qsblue}{RGB}{0,118,190}
+\definecolor{qsteal}{RGB}{0,128,128}
+\definecolor{qsgreen}{RGB}{46,125,50}
+\definecolor{qsamber}{RGB}{200,120,0}
+\definecolor{qsred}{RGB}{178,34,34}
+\definecolor{qsgray}{RGB}{110,110,110}
+\definecolor{qslight}{RGB}{235,241,247}
+\definecolor{qslegacy}{RGB}{242,236,226}
+
+\setbeamercolor{structure}{fg=qsnavy}
+\setbeamercolor{frametitle}{fg=qsnavy}
+\setbeamerfont{frametitle}{size=\Large,series=\bfseries}
+\setbeamertemplate{blocks}[rounded][shadow=false]
+\setbeamercolor{block title}{bg=qsnavy,fg=white}
+\setbeamercolor{block body}{bg=qslight,fg=black}
+\setbeamercolor{block title alerted}{bg=qsamber,fg=white}
+\setbeamercolor{block body alerted}{bg=qslegacy,fg=black}
+\setbeamercolor{block title example}{bg=qsgreen,fg=white}
+\setbeamercolor{block body example}{bg=qslight,fg=black}
+\setbeamertemplate{itemize items}[circle]
+\setbeamertemplate{enumerate items}[default]
+\setbeamersize{text margin left=0.9cm,text margin right=0.7cm}
+
+% ---------- TikZ ----------
+\usetikzlibrary{shapes.geometric, fit, calc, backgrounds, shadows}
+\tikzset{
+    box/.style={draw=qsnavy, thick, rounded corners=2pt, fill=white, align=center,
+                font=\footnotesize, minimum height=0.8cm, inner sep=4pt},
+    legacybox/.style={box, draw=qsamber, fill=qslegacy},
+    store/.style={cylinder, shape border rotate=90, draw=qsnavy, thick, fill=white,
+                  aspect=0.25, align=center, font=\footnotesize, minimum height=0.9cm, inner sep=3pt},
+    legacystore/.style={store, draw=qsamber, fill=qslegacy},
+    ext/.style={box, draw=qsgray, dashed, fill=white},
+    arrow/.style={-{Stealth[length=2mm]}, thick, qsnavy},
+    legacyarrow/.style={-{Stealth[length=2mm]}, thick, qsamber},
+    both/.style={{Stealth[length=2mm]}-{Stealth[length=2mm]}, thick},
+    lbl/.style={font=\tiny, fill=white, inner sep=1pt, text=qsgray},
+    state/.style={draw=qsnavy, thick, rounded corners=3pt, fill=white, font=\footnotesize,
+                  minimum height=0.7cm, minimum width=1.9cm, align=center},
+    good/.style={state, draw=qsgreen, fill=qsgreen!10},
+    bad/.style={state, draw=qsred, fill=qsred!8},
+    stop/.style={state, draw=qsamber, fill=qsamber!10},
+}
+
+% ---------- Helpers ----------
+\newcommand{\divider}[2]{%
+    \dividerbackground
+    \begin{frame}[plain]
+        \vspace{2.9cm}
+        \begin{center}
+            {\color{qsnavy}\Huge\bfseries #1}\\[0.5cm]
+            {\color{qsgray}\large #2}
+        \end{center}
+    \end{frame}
+    \normalbackground
+}
+\newcommand{\src}[1]{{\color{qsgray}\tiny\texttt{#1}}}
+\newcommand{\legacy}{QueueServer 0.x}
+\newcommand{\vtwo}{V2}
+\newcommand{\yes}{{\color{qsgreen}\(\checkmark\)}}
+\newcommand{\no}{{\color{qsred}\(\times\)}}
+\newcommand{\partly}{{\color{qsamber}\(\sim\)}}
+\newcommand{\code}[1]{\texttt{#1}}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+% ---------- Background for title slide ----------
+\newcommand{\titlebackground}{
+    \usebackgroundtemplate{
+        \includegraphics[width=\paperwidth,height=\paperheight]{assets/NSLS2_Header.jpg}
+    }
+}
+
+% ---------- Background for all other slides ----------
+\newcommand{\normalbackground}{
+    \usebackgroundtemplate{
+        \includegraphics[width=\paperwidth,height=\paperheight]{assets/NSLS2_BG.jpg}
+    }
+}
+
+% ---------- Background for section divider slides ----------
+\newcommand{\dividerbackground}{
+    \usebackgroundtemplate{
+        \includegraphics[width=\paperwidth,height=\paperheight]{assets/NSLS2_Divider.jpg}
+    }
+}
+
+% ---------- Image placeholder command ----------
+\newcommand{\imgplaceholder}[2][0.6]{%
+    \begin{center}
+        \fbox{\begin{minipage}{#1\textwidth}
+            \centering\vspace{1.5cm}
+            \textit{[Image: #2]}
+            \vspace{1.5cm}
+        \end{minipage}}
+    \end{center}
+}
+
+% ---------- Title information ----------
+\title{Bluesky QueueServer V2}
+\author{Thomas Hopkins}
+\institute{NSLS-II, Brookhaven National Laboratory}
+\date{\today}
+
+\begin{document}
+
+\input{slides/01_title}
+\input{slides/02_framing}
+\input{slides/03_properties}
+\input{slides/04_architecture}
+\input{slides/05_comparison}
+\input{slides/06_status}
+\input{slides/07_backup}
+\input{slides/08_vocabulary}
+
+\end{document}

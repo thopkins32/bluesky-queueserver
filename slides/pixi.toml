@@ -1,0 +1,18 @@
+[workspace]
+authors = ["Thomas Hopkins"]
+channels = ["conda-forge"]
+name = "Bluesky QueueServer V2"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+build = "tectonic main.tex && mv main.pdf Bluesky_QueueServer_V2.pdf"
+# Rasterize every page to render/page-NN.png for visual checking.
+render = { cmd = "python render.py Bluesky_QueueServer_V2.pdf render", depends-on = ["build"] }
+
+[dependencies]
+tectonic = ">=0.16.9,<0.17"
+python = "3.12.*"
+
+[pypi-dependencies]
+pymupdf = "*"

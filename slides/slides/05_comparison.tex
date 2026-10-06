@@ -1,0 +1,97 @@
+% ==========================================================
+% COMPARISON AND DEMO
+% ==========================================================
+
+\begin{frame}{Side by side (1/2): boundary and contract}
+    \footnotesize
+    \renewcommand{\arraystretch}{1.35}
+    \begin{tabular}{@{}L{2.7cm}L{5.4cm}L{5.4cm}@{}}
+        \toprule
+        & \textbf{\color{qsamber}\legacy{}} & \textbf{\color{qsnavy}\vtwo{}} \\
+        \midrule
+        Public transport & 0MQ REQ/REP (+ PUB/SUB console); REST via a second service & HTTPS JSON + SSE from the controller itself \\
+        Identity & Authenticated at the HTTP server; \code{user}/\code{user\_group} fields trusted by the manager & OIDC JWT verified by the controller; principal = \code{sub} \\
+        Authorization & Roles $\to$ fine-grained scopes (HTTP); group allow/deny lists (manager) & Three scopes; per-operation \code{required\_scope} in the catalog \\
+        What a client can request & Any allowed plan/function name with args, device paths, scripts & Catalogued \code{(operation\_id, version)} with closed JSON Schema \\
+        Exclusive control & String \code{lock\_key}, optional, not identity-bound & Lease: one principal, TTL, renew/release, audited override \\
+        Queue concurrency & Informational \code{plan\_queue\_uid}; last write wins & \code{queue\_revision} + \code{If-Match}/ETag; 412 on stale \\
+        Item identity & New \code{item\_uid} on every add and on push-back & One operation UID for life; attempts are separate rows \\
+        Request retry safety & None at protocol level & Mandatory \code{Idempotency-Key}; 409 on conflicting reuse \\
+        Readiness & \code{status} fields interpreted by each client & \code{/ready} 200/503 with five component fields \\
+        \bottomrule
+    \end{tabular}
+\end{frame}
+
+\begin{frame}{Side by side (2/2): state, failure, lifecycle}
+    \footnotesize
+    \renewcommand{\arraystretch}{1.35}
+    \begin{tabular}{@{}L{2.7cm}L{5.4cm}L{5.4cm}@{}}
+        \toprule
+        & \textbf{\color{qsamber}\legacy{}} & \textbf{\color{qsnavy}\vtwo{}} \\
+        \midrule
+        State store & Redis lists/strings & SQLite WAL on local disk, one transaction per mutation \\
+        Audit & Plan history with results & Append-only events with actor, revision, cursor; SSE resume \\
+        Plan failure & Push back to queue front; optional ignore-failures & \code{failed} blocks dispatch; never requeued automatically \\
+        Unprovable outcome & Depends on which poll noticed & \code{unknown}; dispatch blocked; fence + acknowledgement required \\
+        Manager/controller restart & Watchdog restarts; manager reattaches to live worker & Fail closed; never reattaches; worker self-stops on controller loss \\
+        Worker restart & \code{environment\_open/close/destroy} via API & Only the controller, only after the previous lock is provably released \\
+        Stopping & pause/resume/stop/abort/halt, \code{queue\_stop} & Safe stop at next checkpoint; stop after current \\
+        Packaging & 3 repos, mutually unpinned & 1 repo, 1 version; worker revision hashes environment lock \\
+        Python & 3.10+ (httpserver, api) & 3.11+ (shared distribution) \\
+        \bottomrule
+    \end{tabular}
+\end{frame}
+
+\begin{frame}[fragile]{Live demo}
+    \begin{columns}[T]
+        \begin{column}{0.6\textwidth}
+\begin{lstlisting}[style=http, basicstyle=\ttfamily\tiny, breaklines=false]
+# terminal 1: controller (it spawns the worker)
+pixi run -e py312 python demo/setup.py
+pixi run -e py312 start-qserver-v2 --config demo/state/controller.yml --port 8443
+# terminal 2: durable event stream
+qsv2 stream
+# terminal 3: the walk-through
+qsv2 ready                              # 200, five components
+qsv2 --as forged queue                  # 401 unknown signing key
+qsv2 --as viewer submit                 # 403 scope required
+qsv2 lease acquire --ttl 600            # 201 holder=operator
+qsv2 --as admin submit                  # 403 lease belongs to another principal
+qsv2 submit --raw '{... "num": 11}'     # 422 schema path
+qsv2 submit --raw '{"operation_id": "execute_plan", ...}'   # 422 not in catalog
+qsv2 submit --num 2 --delay 0.5         # 201 ETag "qrev-1"
+qsv2 --stale submit                     # 412 current revision
+qsv2 start                              # 201 admitted work recorded
+qsv2 --key k lease renew  (twice)       # 200, 200 identical
+qsv2 --key k lease renew --ttl 900      # 409 idempotency_conflict
+
+qsv2 submit --num 10 --delay 2 && qsv2 start
+qsv2 kill-worker                        # SIGKILL mid-plan
+qsv2 ready                              # 503 dispatch=blocked
+qsv2 ack --note "..."                   # 200; worker.fenced already recorded
+qsv2 ready                              # 200; next item queued, not resumed
+# restart terminal 1, then:
+qsv2 events --after 0                   # everything is still there
+\end{lstlisting}
+        \end{column}
+        \begin{column}{0.38\textwidth}
+            \footnotesize
+            \textbf{What to watch for}
+            \begin{itemize}
+                \item Every mutation prints its \code{If-Match} and \code{Idempotency-Key}; every response its ETag.
+                \item Rejections happen \emph{before} any write: the revision does not move on 401/403/412/422.
+                \item In the stream: \code{actor} is the principal for edits and \code{scheduler} for claims;
+                      \code{qrev} increases monotonically.
+                \item After \code{kill-worker}: \code{operation.unknown} carries
+                      \code{cleanup\_completed: false} and the transport diagnostic;
+                      \code{dispatch.blocked} carries \code{requires\_fence: true};
+                      \code{worker.fenced} records the lock probe.
+                \item Acknowledgement needs the lease, the current revision and a note. The remaining item is
+                      \emph{not} resumed.
+            \end{itemize}
+            \vspace{0.2cm}
+            {\color{qsgray}\footnotesize \code{qsv2} is \code{demo/qsv2.py}: ~200 lines of \code{httpx}, no SDK.
+            \code{demo/walkthrough.sh} runs the same sequence with pauses.\par}
+        \end{column}
+    \end{columns}
+\end{frame}

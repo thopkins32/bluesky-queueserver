@@ -1,0 +1,164 @@
+% ==========================================================
+% STATUS, COSTS, PATH, DISCUSSION
+% ==========================================================
+
+\divider{Where \vtwo{} actually is}{what exists, what does not, what I chose not to build}
+
+% ----------------------------------------------------------
+\begin{frame}{Implemented today vs.\ not yet}
+    \begin{columns}[T]
+        \begin{column}{0.5\textwidth}
+            \begin{exampleblock}{Runs today (simulator only)}
+                \footnotesize
+                \begin{itemize}
+                    \item Controller: authority lock, scheduler, durable attempts, dispatch blocks, recovery
+                    \item SQLite store: migrations, revisions, events, lease, idempotency records;
+                          backup/restore/migrate via \code{qserver-v2-admin}
+                    \item OIDC JWT authentication, three scopes, HTTPS + SSE, OpenAPI
+                    \item Worker protocol: heartbeat, correlation, safe stop, orphan stop, lock and fencing
+                    \item Worker SDK (\code{registry.register}), profile-mode loader, worker revision
+                    \item One operation: \code{simulated-count} v1 on \code{ophyd.sim}; systemd unit, example configs
+                    \item 81 behavioural tests in \code{tests/v2/} (contracts, storage, scheduler, recovery,
+                          web, worker runtime, admin), including the fault matrix
+                \end{itemize}
+            \end{exampleblock}
+        \end{column}
+        \begin{column}{0.48\textwidth}
+            \begin{alertblock}{Not yet}
+                \footnotesize
+                \begin{itemize}
+                    \item Any real beamline adapter, test IOC run, or hardware approval
+                    \item Operator UI, client SDK, console-output streaming
+                    \item Pause/resume/stop/abort/halt as a user-facing surface; today only
+                          \emph{safe stop at next checkpoint} and \emph{stop after current}
+                    \item Loop mode, instructions, batch submission
+                    \item Interactive kernel, script upload, function execution (deliberately; next slide)
+                    \item Compatibility with \code{bluesky-queueserver-api}, \code{bluesky-widgets},
+                          \code{bluesky-httpserver}
+                    \item HA, PostgreSQL, SQLite over NFS, worker reattachment, automatic retry
+                \end{itemize}
+            \end{alertblock}
+            \vspace{0.1cm}
+            {\scriptsize\color{qsgray} Size, for orientation: \code{v2/} is about 7.3k lines;
+            \code{manager/} about 20k; \code{bluesky-httpserver} and \code{bluesky-queueserver-api}
+            roughly 6k each excluding docstrings. Smaller because it does less, on purpose.\par}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{Things I deliberately did not build}
+    \small
+    \renewcommand{\arraystretch}{1.15}
+    \begin{tabular}{@{}L{4.2cm}L{9.0cm}@{}}
+        \toprule
+        \textbf{Not built} & \textbf{Why} \\
+        \midrule
+        A generic \code{execute\_plan(name, args, kwargs)} & It recreates the namespace-as-API surface. Everything else in \vtwo{} is downstream of refusing it. \\
+        0.x protocol or queue compatibility & Compatibility keeps the dynamic execution, transport and storage contracts that are the reason for the rewrite. Coexistence instead: separate state, endpoints and authority. \\
+        Controller-managed environment updates (install, git pull, env open/close) & Deployment changes belong to deployment tooling with their own audit; the worker revision records what ran. \\
+        Watchdog and worker reattachment & Independent lifetimes are where the two views of the truth diverge. \vtwo{} fails closed and asks a human. \\
+        Redis & SQLite gives the transaction, revision and event boundary one controller needs, on a local disk, with no second service. \\
+        Bluesky inside the controller & It couples the public authority to beamline dependencies and plan failures. \\
+        Active-active or HA controllers & Leadership and fencing across hosts is not justified for one instrument; one authority is the point. \\
+        Bluesky document storage & Documents stay in the RunEngine subscriptions; the controller keeps run UIDs only. \\
+        \bottomrule
+    \end{tabular}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{Costs and risks, honestly}
+    \begin{columns}[T]
+        \begin{column}{0.5\textwidth}
+            \textbf{What beamlines pay}
+            \small
+            \begin{itemize}
+                \item \textbf{Adapters are work.} Every exposed workflow needs a request model, a device map
+                      and a reviewed registration. Boilerplate risk is real; offline generation from
+                      \code{existing\_plans\_and\_devices.yaml} and annotations can draft them, not commit them.
+                \item \textbf{Less freedom at the API.} No ad-hoc plan, no script upload, no function call
+                      from a GUI. Interactive Bluesky stays available for that; it just does not share
+                      authority with \vtwo{}.
+                \item \textbf{An identity provider is required.} Today's single-user API key is not an option.
+                \item \textbf{Local disk only.} The controller host owns the state; moving it is a backup/restore.
+                \item \textbf{Operators see new words}: take control, release control, stop after current,
+                      recovery required. The UI must hide lease IDs and revisions.
+            \end{itemize}
+        \end{column}
+        \begin{column}{0.48\textwidth}
+            \textbf{What the project pays}
+            \small
+            \begin{itemize}
+                \item \textbf{Two codebases during transition.} 0.x needs a stated maintenance policy
+                      while \vtwo{} matures; I do not think both should be developed indefinitely.
+                \item \textbf{The ecosystem does not follow for free.} \code{bluesky-widgets},
+                      \code{queue-monitor}, agents built on \code{bluesky-queueserver-api} need a \vtwo{} client.
+                \item \textbf{My failure matrix may be wrong.} It is tested against a fault-injecting
+                      worker and the simulator, not against years of beamline incidents. That knowledge is
+                      in this room.
+                \item \textbf{Single author so far.} Review by people who know why 0.x made each choice
+                      is the fastest way to find what I missed.
+            \end{itemize}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{A path, not a cliff}
+    \begin{columns}[T]
+        \begin{column}{0.5\textwidth}
+            \small
+            \begin{enumerate}
+                \item \textbf{Agree on the properties first.} If the eight properties are right, they constrain
+                      any implementation, including a hypothetical 0.x successor that is not \vtwo{}.
+                \item \textbf{Review \vtwo{} against them.} Code, tests and the failure matrix are in-tree;
+                      the simulator demo runs on a laptop.
+                \item \textbf{One workflow, one beamline, simulation or test IOC.} Load the real profile in
+                      profile mode, write one adapter, run the failure matrix against it.
+                \item \textbf{Coexist.} 0.x keeps serving what has not moved. No shared queue, endpoint,
+                      worker or state; one authority per instrument at a time.
+                \item \textbf{Decide the 0.x policy together}: security fixes only, or feature freeze with a date.
+                \item \textbf{Only then} talk about hardware, a UI, and a client library.
+            \end{enumerate}
+        \end{column}
+        \begin{column}{0.48\textwidth}
+            \begin{block}{What would change my mind}
+                \small
+                \begin{itemize}
+                    \item A property on the list that you can show is wrong for beamline operations.
+                    \item A workflow that cannot be expressed as a catalogued operation without losing
+                          something scientifically essential.
+                    \item Evidence that 0.x can be brought to these properties incrementally without breaking
+                          its public API anyway.
+                \end{itemize}
+            \end{block}
+            \vspace{0.2cm}
+            {\small\color{qsgray} My preference is clear: converge on one implementation once \vtwo{} has
+            earned it, rather than maintain two. I would rather be argued out of that in this room than
+            discover the reason at a beamline.\par}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{Questions I would like this group to answer}
+    \large
+    \begin{enumerate}
+        \setlength{\itemsep}{0.35cm}
+        \item Which of the eight properties do you disagree with, and why?
+        \item Which 0.x capability did I drop that you would fight to keep
+              (interactive kernel, script upload, function execution, loop mode, \ldots)?
+        \item Is ``catalog, not namespace'' workable for the beamlines you support?
+              Which workflow would you pilot first?
+        \item Where is the failure matrix wrong? What incident would it have handled badly?
+        \item If \vtwo{} proceeds, what is the right maintenance policy for 0.x?
+    \end{enumerate}
+    \vspace{0.6cm}
+    \begin{center}
+        {\normalsize\color{qsgray} Code: \code{src/bluesky\_queueserver/v2/} \quad
+        Tests: \code{src/bluesky\_queueserver/tests/v2/} \quad
+        Docs: \code{docs/source/queueserver\_v2.rst} \quad
+        Demo: \code{demo/}\\[0.2cm]
+        \small Backup slides: API surface, durable model, example payloads, glossary, 0.x\,$\rightarrow$\,V2 phrasebook.}
+    \end{center}
+\end{frame}

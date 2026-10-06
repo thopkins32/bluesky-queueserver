@@ -1,0 +1,187 @@
+% ==========================================================
+% ARCHITECTURE
+% ==========================================================
+
+\divider{How \vtwo{} is put together}{same shape, different contracts}
+
+% ----------------------------------------------------------
+\begin{frame}{Process and trust boundaries, side by side}
+    \begin{columns}[T]
+        \begin{column}{0.5\textwidth}
+            \centering {\footnotesize\bfseries\color{qsamber} \legacy{} \quad (3 repositories)}\\[0.1cm]
+            \begin{tikzpicture}[node distance=0.45cm and 0.5cm, scale=0.8, transform shape]
+                \node[ext] (cli) {GUI / agent / \code{qserver} CLI};
+                \node[legacybox, below=0.55cm of cli, xshift=-1.6cm] (http) {bluesky-httpserver\\\tiny auth, roles $\to$ scopes};
+                \node[legacybox, below=0.55cm of http, xshift=1.6cm] (mgr) {RE Manager\\\tiny queue, 0MQ REP, lock};
+                \node[legacystore, right=0.8cm of mgr] (redis) {Redis};
+                \node[legacybox, left=0.6cm of mgr] (wd) {Watchdog\\\tiny spawns, restarts};
+                \node[legacybox, below=0.6cm of mgr] (wrk) {RE Worker\\\tiny RunEngine, namespace};
+                \node[ext, below=0.45cm of wrk] (ioc) {IOCs / \code{ophyd.sim}};
+                \draw[legacyarrow] (cli) -- node[lbl, left] {HTTPS} (http);
+                \draw[legacyarrow] (http) -- node[lbl, left, xshift=-2pt] {0MQ + \code{user} field} (mgr);
+                \draw[legacyarrow, dashed] (cli) -- node[lbl, right] {0MQ, client asserts \code{user}} (mgr);
+                \draw[both, qsamber] (mgr) -- (redis);
+                \draw[both, qsamber] (wd) -- node[lbl, above] {pipe} (mgr);
+                \draw[legacyarrow] (wd) |- node[lbl, pos=0.75, above] {spawn / kill} (wrk);
+                \draw[both, qsamber] (mgr) -- node[lbl, right] {pipe JSON-RPC} (wrk);
+                \draw[legacyarrow] (wrk) -- (ioc);
+            \end{tikzpicture}
+        \end{column}
+        \begin{column}{0.5\textwidth}
+            \centering {\footnotesize\bfseries\color{qsnavy} \vtwo{} \quad (1 repository, 1 release)}\\[0.1cm]
+            \begin{tikzpicture}[node distance=0.45cm and 0.5cm, scale=0.8, transform shape]
+                \node[ext] (cli) {GUI / agent / \code{curl}};
+                \node[box, below=0.75cm of cli] (ctl) {Controller\\\tiny OIDC, lease, scheduler, attempts, events};
+                \node[store, right=0.8cm of ctl] (db) {SQLite\\\tiny WAL, locks};
+                \node[ext, left=0.6cm of ctl] (sysd) {systemd\\\tiny supervises controller only};
+                \node[box, below=0.9cm of ctl] (wrk) {Worker\\\tiny RunEngine, reviewed catalog};
+                \node[ext, below=0.45cm of wrk] (ioc) {\code{ophyd.sim} today / IOCs later};
+                \draw[arrow] (cli) -- node[lbl, right] {HTTPS JSON + SSE, bearer JWT} (ctl);
+                \draw[both, qsnavy] (ctl) -- node[lbl, above] {1 txn} (db);
+                \draw[arrow, dashed, qsgray] (sysd) -- (ctl);
+                \draw[both, qsnavy] (ctl) -- node[lbl, left, align=right] {socketpair, framed JSON\\heartbeat 1\,s / 5\,s} (wrk);
+                \draw[arrow] (wrk) -- (ioc);
+                \draw[arrow, dashed] (ctl.south east) to[bend left=30] node[lbl, right, align=left] {spawn, only\\after fence} (wrk.north east);
+            \end{tikzpicture}
+        \end{column}
+    \end{columns}
+    \vspace{0.1cm}
+    {\footnotesize\color{qsgray} Same split, same reason: keep Bluesky and Ophyd failures out of the process that
+    owns the queue. \vtwo{} removes the second control path, the watchdog and the external store;
+    the controller is the only durable authority.\par}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{Operation lifecycle}
+    \begin{center}
+    \begin{tikzpicture}[node distance=0.35cm and 0.45cm, scale=0.95, transform shape]
+        \node[state] (sub) {submitted};
+        \node[state, right=of sub] (que) {queued};
+        \node[state, right=of que] (cla) {claimed};
+        \node[state, right=of cla] (run) {running};
+        \node[good, right=1.0cm of run, yshift=1.6cm] (ok) {succeeded};
+        \node[stop, below=of ok] (abo) {aborted\\\tiny safe stop at checkpoint};
+        \node[bad, below=of abo] (fail) {failed};
+        \node[bad, below=of fail] (intr) {interrupted\\\tiny controller shutdown};
+        \node[bad, below=of intr] (unk) {unknown\\\tiny unprovable};
+        \node[stop, below=1.2cm of que] (can) {cancelled};
+        \draw[arrow] (sub) -- (que);
+        \draw[arrow] (que) -- (cla);
+        \draw[arrow] (cla) -- (run);
+        \foreach \t in {ok,abo,fail,intr,unk} { \draw[arrow] (run.east) -- (\t.west); }
+        \draw[arrow] (cla.south east) to[out=-40, in=180] (intr.west);
+        \draw[arrow] (cla.south east) to[out=-50, in=180] (unk.west);
+        \draw[arrow, qsamber] (que) -- node[lbl, left] {lease holder} (can);
+        \draw[decorate, decoration={brace, amplitude=4pt, raise=2pt}, qsgreen, thick]
+            (sub.north west) -- (que.north east) node[midway, above=6pt, font=\scriptsize, text=qsgreen] {pending: add / replace / reorder / cancel};
+        \draw[decorate, decoration={brace, amplitude=4pt, raise=2pt}, qsnavy, thick]
+            (cla.north west) -- (run.north east) node[midway, above=6pt, font=\scriptsize, text=qsnavy] {immutable; one durable attempt};
+        \node[font=\scriptsize, text=qsgray, below=0.3cm of cla, xshift=-0.45cm, align=center] {attempt row written\\\emph{before} worker contact};
+        \draw[decorate, decoration={brace, amplitude=4pt, mirror, raise=2pt}, qsred, thick]
+            ($(fail.north east)+(0.1,0)$) -- ($(unk.south east)+(0.1,0)$) node[midway, right=6pt, font=\scriptsize, text=qsred, align=left] {blocks dispatch\\no automatic retry\\\scriptsize\texttt{interrupted}, \texttt{unknown}\\also need fence evidence};
+    \end{tikzpicture}
+    \end{center}
+    \vspace{-0.1cm}
+    {\footnotesize A queue execution is \code{running} $\to$ \code{stopping} (stop after current) $\to$ \code{completed} $\mid$
+    \code{stopped} $\mid$ \code{blocked}. Policy today: \code{stop\_on\_non\_success}.}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{The private worker protocol}
+    \begin{columns}[T]
+        \begin{column}{0.55\textwidth}
+            \footnotesize
+            \begin{itemize}
+                \item \textbf{Transport:} \code{socketpair(AF\_UNIX)} created by the controller; the child FD is passed
+                      on the command line, never a TCP port or a shell. \src{v2/worker\_protocol.py:301-322}
+                \item \textbf{Framing:} 4-byte length + JSON, 1\,MiB cap enforced before the body is read.
+                \item \textbf{Correlation:} every message has \code{message\_id}; responses must carry the request's
+                      \code{correlation\_id}, the attempt UID and the worker instance UID. A mismatch is \code{unknown},
+                      not ``probably fine''.
+                \item \textbf{Liveness during a plan:} the RunEngine runs in a one-thread executor; the asyncio
+                      control loop keeps answering \code{ping} and \code{safe\_stop} on the same socket.
+                      \src{v2/worker/runtime.py:211-246, 364-371}
+                \item \textbf{Safe stop:} \code{RE.request\_pause(defer=True)}, acknowledged, cleanup awaited.
+                \item \textbf{Orphan policy:} on controller loss the worker stops accepting work, requests the pause,
+                      waits for cleanup, releases its lock and exits with code 2.
+                \item \textbf{Worker lock} is the fence: acquired at start, released after executor shutdown.
+            \end{itemize}
+        \end{column}
+        \begin{column}{0.43\textwidth}
+            \begin{block}{Message types}
+                \scriptsize
+                \begin{tabular}{@{}l@{\hspace{6pt}}l@{}}
+                    W $\to$ C & \code{startup.catalog}, \code{startup.ready} \\
+                    C $\to$ W & \code{execution.request} \\
+                    W $\to$ C & \code{execution.accepted}, \code{execution.completed} \\
+                    both & \code{ping} / \code{pong} \\
+                    C $\to$ W & \code{safe\_stop.request} $\to$ \code{.ack} \\
+                    C $\to$ W & \code{shutdown.request} $\to$ \code{.ack} \\
+                \end{tabular}
+            \end{block}
+            \begin{block}{Faults exercised by tests}
+                \scriptsize
+                \code{eof}, \code{exit}, \code{timeout}, \code{malformed}, \code{oversized}, \code{wrong-protocol},
+                \code{wrong-worker}, \code{wrong-attempt}, \code{wrong-correlation}, \code{invalid-result},
+                socket loss mid-plan, SIGKILL mid-plan. Each becomes exactly one \code{unknown} and one dispatch block.
+                \src{tests/v2/fault\_worker.py; test\_worker\_runtime.py:488-560}
+            \end{block}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}[fragile]{Adopting a beamline without rewriting its profile collection}
+    \begin{columns}[T]
+        \begin{column}{0.42\textwidth}
+            \footnotesize
+            The worker's \emph{profile mode} loads the existing startup directory the way 0.x and IPython do:
+            top-level \code{*.py}/\code{*.ipy} in lexical order, one isolated \code{InteractiveShell}.
+            Then it runs one extra file, the \textbf{adapter}, and calls
+            \code{register\_operations(registry, profile)}. \src{v2/worker/profile.py:31-81}
+            \begin{itemize}
+                \item \code{profile} is the loaded namespace, read-only.
+                \item Device maps are explicit deployment code, not client input.
+                \item Only the path reachable from a registered operation needs hardening;
+                      commissioning helpers stay private.
+                \item Startup and adapter hashes become part of \code{worker\_revision}.
+                \item \code{existing\_plans\_and\_devices.yaml} and annotations are good \emph{offline} inputs
+                      for drafting adapters; a human commits each one.
+            \end{itemize}
+        \end{column}
+        \begin{column}{0.58\textwidth}
+\begin{lstlisting}[style=python, aboveskip=0pt, belowskip=0pt, breaklines=false]
+# adapter.py -- private worker code, reviewed and committed
+DETECTORS = {"xs": xs, "merlin": merlin}
+MOTORS = {"ssx": zpssx, "ssy": zpssy}
+
+class Fly2DRequest(StrictModel):
+    detectors: list[Literal["xs", "merlin"]]
+    fast_axis: Literal["ssx", "ssy"]
+    slow_axis: Literal["ssx", "ssy"]
+    fast_range: tuple[float, float]
+    slow_range: tuple[float, float]
+    fast_points: Annotated[int, Field(ge=2, le=4000)]
+    slow_points: Annotated[int, Field(ge=1, le=4000)]
+    exposure: Annotated[float, Field(gt=0, le=10)]
+
+def register_operations(registry, profile):
+    @registry.register(
+        operation_id="hxn.fly2d", operation_version="1",
+        request_model=Fly2DRequest, result_model=RunUids,
+        required_scope=AuthorizationScope.CONTROL,
+        orphan_policy=OrphanPolicy.REQUEST_STOP)
+    def prepare(request, context):
+        fast, slow = MOTORS[request.fast_axis], MOTORS[request.slow_axis]
+        plan = profile["fly2dpd"](
+            [DETECTORS[d] for d in request.detectors],
+            fast, *request.fast_range, request.fast_points,
+            slow, *request.slow_range, request.slow_points,
+            request.exposure)
+        return PreparedOperation(
+            plan=plan,
+            build_result=lambda uids: RunUids(run_uids=list(uids)))
+\end{lstlisting}
+        \end{column}
+    \end{columns}
+\end{frame}

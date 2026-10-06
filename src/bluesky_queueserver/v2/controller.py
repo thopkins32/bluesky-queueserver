@@ -19,6 +19,7 @@ from .contracts import (
     AttemptView,
     AuthorizationScope,
     CatalogView,
+    ContractValidationError,
     ControlLeaseView,
     HealthView,
     OperationDescriptor,
@@ -716,7 +717,9 @@ class ControllerService:
         for descriptor in self.worker.catalog.operations:
             if descriptor.operation_id == operation_id and descriptor.operation_version == operation_version:
                 return descriptor
-        raise ValueError(f"operation {operation_id!r} version {operation_version!r} is not in the worker catalog")
+        raise ContractValidationError(
+            f"operation {operation_id!r} version {operation_version!r} is not in the worker catalog"
+        )
 
     def _require_open(self) -> None:
         if not self.holds_authority or self._scheduler_task is None:

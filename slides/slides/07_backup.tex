@@ -1,0 +1,145 @@
+% ==========================================================
+% BACKUP
+% ==========================================================
+
+\divider{Backup}{reference material}
+
+% ----------------------------------------------------------
+\begin{frame}{Backup: public HTTP surface}
+    \footnotesize
+    \begin{columns}[T]
+        \begin{column}{0.46\textwidth}
+            \textbf{Queries} (\code{queueserver:read})
+            \begin{itemize}
+                \item \code{GET /health}, \code{GET /ready} \hfill {\color{qsgray}unauthenticated}
+                \item \code{GET /api/v2/openapi.json}
+                \item \code{GET /api/v2/catalog}
+                \item \code{GET /api/v2/control-lease}
+                \item \code{GET /api/v2/queue} \hfill {\color{qsgray}ETag \code{"qrev-N"}}
+                \item \code{GET /api/v2/queue-executions/\{uid\}}
+                \item \code{GET /api/v2/operations/\{uid\}}
+                \item \code{GET /api/v2/attempts/\{uid\}}
+                \item \code{GET /api/v2/events?after=\&limit=}
+                \item \code{GET /api/v2/events/stream} \hfill {\color{qsgray}SSE, \code{Last-Event-ID}}
+            \end{itemize}
+        \end{column}
+        \begin{column}{0.52\textwidth}
+            \textbf{Commands} (\code{queueserver:control}; all need \code{Idempotency-Key}; queue-changing ones need \code{If-Match})
+            \begin{itemize}
+                \item \code{POST /api/v2/control-lease} \code{/renew} \code{/release}
+                \item \code{POST /api/v2/control-lease/override} \hfill {\color{qsgray}\code{admin}, reason}
+                \item \code{POST /api/v2/operations}
+                \item \code{PUT /api/v2/operations/\{uid\}} \hfill {\color{qsgray}replace pending}
+                \item \code{DELETE /api/v2/operations/\{uid\}} \hfill {\color{qsgray}cancel pending}
+                \item \code{POST /api/v2/queue/reorder} \hfill {\color{qsgray}complete permutation}
+                \item \code{POST /api/v2/queue-executions}
+                \item \code{POST /api/v2/queue-executions/\{uid\}/stop} \hfill {\color{qsgray}after current}
+                \item \code{POST /api/v2/attempts/\{uid\}/safe-stop}
+                \item \code{POST /api/v2/recovery/acknowledge}
+            \end{itemize}
+            \vspace{0.1cm}
+            Errors: 401 \code{authentication\_failed}, 403 \code{forbidden}, 404 \code{not\_found},
+            409 \code{state\_conflict}/\code{idempotency\_conflict}, 412 \code{stale\_revision},
+            422 \code{validation\_error}/\code{invalid\_request}, 428 \code{precondition\_required},
+            503 \code{unavailable}.
+        \end{column}
+    \end{columns}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{Backup: durable model and event types}
+    \footnotesize
+    \begin{columns}[T]
+        \begin{column}{0.5\textwidth}
+            \textbf{SQLite tables} \src{v2/storage.py:396-552}
+            \begin{itemize}
+                \item \code{operations} -- immutable intent, state, result, \code{replaced\_by}
+                \item \code{queue\_entries} -- pending order (\code{position} unique)
+                \item \code{queue\_executions}, \code{queue\_execution\_admissions}
+                \item \code{execution\_attempts} -- one row per controller-authorized invocation
+                \item \code{worker\_instances} -- revision, provenance, catalog, lock path
+                \item \code{dispatch\_blocks} -- kind, \code{requires\_fence}, fence/ack evidence
+                \item \code{control\_lease} -- singleton: subject, expiry
+                \item \code{controller\_metadata} -- singleton: \code{queue\_revision}, paths, active block
+                \item \code{controller\_events} -- append-only, \code{event\_id} autoincrement
+                \item \code{idempotency\_records} -- (principal, method, target, key) $\to$ stored response
+                \item \code{schema\_migrations}
+            \end{itemize}
+        \end{column}
+        \begin{column}{0.48\textwidth}
+            \textbf{Event types} \src{v2/storage.py:58-93}
+            \begin{itemize}
+                \item \code{lease.} \code{acquired} $\cdot$ \code{renewed} $\cdot$ \code{released} $\cdot$ \code{expired} $\cdot$ \code{overridden}
+                \item \code{operation.} \code{submitted} $\cdot$ \code{queued} $\cdot$ \code{replaced} $\cdot$ \code{cancelled}
+                      $\cdot$ \code{claimed} $\cdot$ \code{running} $\cdot$ \code{succeeded} $\cdot$ \code{failed} $\cdot$
+                      \code{aborted} $\cdot$ \code{interrupted} $\cdot$ \code{unknown}
+                \item \code{queue.reordered}
+                \item \code{queue\_execution.} \code{started} $\cdot$ \code{admitted} $\cdot$ \code{stop\_requested} $\cdot$
+                      \code{stopped} $\cdot$ \code{completed} $\cdot$ \code{blocked}
+                \item \code{attempt.} \code{stop\_requested} $\cdot$ \code{stop\_acknowledged}
+                \item \code{dispatch.blocked}, \code{recovery.acknowledged}
+                \item \code{worker.} \code{started} $\cdot$ \code{ready} $\cdot$ \code{exited} $\cdot$ \code{fenced}
+                \item \code{controller.shutdown\_requested}, \code{restore.requires\_review}
+            \end{itemize}
+            \vspace{0.1cm}
+            Every event carries \code{actor\_kind} (\code{principal} / \code{scheduler} / \code{system}),
+            \code{actor\_id}, the related UIDs, \code{queue\_revision} and a typed payload.
+        \end{column}
+    \end{columns}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}[fragile]{Backup: what a submission and a result look like}
+    \begin{columns}[T]
+        \begin{column}{0.46\textwidth}
+\begin{lstlisting}[style=http, basicstyle=\ttfamily\tiny]
+POST /api/v2/operations
+Authorization: Bearer <RS256 JWT, sub=operator>
+Idempotency-Key: 8e693cbb-...
+If-Match: "qrev-9"
+
+{"operation_id": "simulated-count",
+ "operation_version": "1",
+ "parameters": {"detectors": ["det"],
+                "num": 10, "delay": 2.0}}
+\end{lstlisting}
+\begin{lstlisting}[style=http, basicstyle=\ttfamily\tiny]
+HTTP/1.1 201 Created
+ETag: "qrev-10"
+X-Request-ID: ...
+
+{"operation_uid": "03d96e7a-...",
+ "state": "queued", "queue_position": 0,
+ "submitted_by": "operator",
+ "descriptor_fingerprint": "sha256:43e6c5...",
+ "attempt_uid": null, "result": null, ...}
+\end{lstlisting}
+        \end{column}
+        \begin{column}{0.544\textwidth}
+\begin{lstlisting}[style=http, basicstyle=\ttfamily\tiny]
+id: 30
+event: operation.unknown
+data: {"event_id": 30, "actor_kind": "scheduler",
+       "actor_id": "queue-execution:4f16de01-...",
+       "operation_uid": "03d96e7a-...",
+       "attempt_uid": "6bf91d79-...",
+       "worker_instance_uid": "f4f344ee-...",
+       "queue_revision": 16,
+       "payload": {"cleanup_completed": false,
+                   "diagnostic": "worker transport reached EOF"}}
+
+id: 31
+event: dispatch.blocked
+data: {..., "payload": {"kind": "unknown",
+       "requires_fence": true,
+       "reason": "worker transport reached EOF"}}
+
+id: 33
+event: worker.fenced
+data: {..., "actor_kind": "system",
+       "payload": {"method": "exclusive-flock",
+                   "lock_path": ".../state.sqlite3.worker.lock"}}
+\end{lstlisting}
+        \end{column}
+    \end{columns}
+\end{frame}

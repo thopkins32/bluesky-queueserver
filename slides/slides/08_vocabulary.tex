@@ -1,0 +1,138 @@
+% ==========================================================
+% VOCABULARY (reference material)
+% ==========================================================
+
+\newcommand{\term}[2]{\textbf{\color{qsnavy}#1} & #2 \\}
+\newenvironment{terms}
+    {\footnotesize\renewcommand{\arraystretch}{1.3}\begin{tabular}{@{}L{2.9cm}L{10.3cm}@{}}}
+    {\end{tabular}}
+
+% ----------------------------------------------------------
+\begin{frame}{Reference: vocabulary (1/4) -- processes, operations, identity}
+    \framesubtitle{Terms used with a specific meaning throughout the talk}
+    \begin{terms}
+        \term{Controller}{The one long-lived process per instrument. Owns the public HTTPS/SSE boundary,
+            authentication, the lease, the queue, the scheduler, attempts, events and the worker's lifecycle.
+            Roughly where \legacy{}'s RE Manager and HTTP server sit, folded into one authority.}
+        \term{Worker}{The subordinate process the controller launches. Owns the RunEngine, the device objects
+            and the reviewed operation catalog; runs at most one attempt at a time. Owns no durable state,
+            no public endpoint and no recovery authority. Roughly \legacy{}'s RE Worker.}
+        \term{Operation}{One unit of submitted intent: \code{(operation\_id, operation\_version, parameters)}.
+            Immutable once submitted; keeps one \code{operation\_uid} from submission to its terminal state.
+            Replaces \legacy{}'s ``queue item'' / ``plan''.}
+        \term{Catalog, descriptor}{The explicit list the worker publishes at startup: for each operation its
+            id, version, request JSON Schema, result JSON Schema, required scope and orphan policy.
+            The controller refuses anything not in it.}
+        \term{Worker revision}{A SHA-256 over what actually runs: package and protocol versions, descriptors,
+            Bluesky/Ophyd versions, environment lock digest, startup and adapter source hashes.
+            Changes when the implementation changes; \code{operation\_version} changes only when the public meaning does.}
+        \term{Principal}{The authenticated identity: the \code{sub} claim of a verified OIDC JWT.
+            Established by the controller, never supplied in a request body.}
+        \term{Scope}{A coarse right carried by the token: \code{queueserver:read} $\subset$
+            \code{queueserver:control} $\subset$ \code{queueserver:admin}.}
+    \end{terms}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{Reference: vocabulary (2/4) -- queue, lease, revision}
+    \begin{terms}
+        \term{Pending}{An operation that is \code{submitted} or \code{queued}: it sits in the ordered queue and
+            may still be replaced, reordered or cancelled by the lease holder.}
+        \term{Control lease}{Time-bounded, exclusive permission for \emph{one principal} to make external changes:
+            submit, cancel, replace, reorder, start or stop execution, acknowledge recovery.
+            Acquired, renewed, released; an admin may override it with a recorded reason.
+            It is \emph{not} permission for the scheduler to run things.}
+        \term{Queue revision}{A single monotonic counter, \code{qrev-N}, bumped by every change to the queue,
+            whether made by a client or by the scheduler. Returned as an HTTP \code{ETag}; every queue mutation
+            must send it back as \code{If-Match}. Stale value $\Rightarrow$ 412, nothing written.}
+        \term{Queue execution}{A durable record that authorizes the scheduler to work through the queue.
+            Stores who started it, the policy and the admitted operations. Lives independently of the lease:
+            the browser can close and the lease can expire; admitted work continues.
+            States: \code{running}, \code{stopping}, \code{completed}, \code{stopped}, \code{blocked}.}
+        \term{Admitted}{In the set of operations a queue execution is allowed to run. Pending work is admitted
+            when the execution starts and as it is added while the execution is \code{running}.
+            A \code{stopping} or \code{stopped} execution admits nothing new.}
+        \term{Stop after current}{\code{POST \ldots/queue-executions/\{uid\}/stop}: the execution becomes
+            \code{stopping}; the current attempt finishes; no further claims are made. The 0.x analogue is
+            \code{queue\_stop}.}
+    \end{terms}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{Reference: vocabulary (3/4) -- claim, attempt, dispatch}
+    \begin{terms}
+        \term{Scheduler}{The loop inside the controller that, whenever a queue execution is \code{running},
+            no attempt is active and dispatch is not blocked, takes the next admitted operation.}
+        \term{Claim}{The scheduler's first step, done \emph{by the controller} on behalf of the current
+            worker instance: in one SQLite transaction it removes the operation from the pending queue, writes an
+            attempt row, bumps the queue revision and appends \code{operation.claimed}.
+            This happens \emph{before} the worker is contacted, so a crash at any later point leaves evidence that
+            execution was authorized. A claimed operation can no longer be edited.}
+        \term{Attempt}{One controller-authorized invocation of an operation on one specific worker instance.
+            Has its own UID and its own state (\code{claimed}, \code{running}, then a terminal state).
+            An operation may in principle have several attempts over its life; a new attempt never overwrites an
+            earlier one.}
+        \term{Dispatch}{Sending the claimed attempt to the worker as an \code{execution.request}.
+            When the worker answers \code{execution.accepted}, the attempt and operation become \code{running}.}
+        \term{Worker instance}{One launch of the worker process, identified by a UID the controller generates.
+            Attempts, events and the worker lock refer to the instance, so ``which worker did this'' is never ambiguous.}
+        \term{Safe stop}{\code{POST \ldots/attempts/\{uid\}/safe-stop}: ask the worker to pause the RunEngine
+            at its next checkpoint and clean up. Acknowledged and completed $\Rightarrow$ the attempt is \code{aborted}.
+            A result that arrives first still wins.}
+    \end{terms}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{Reference: vocabulary (4/4) -- outcomes, blocking, fencing, recovery}
+    \begin{terms}
+        \term{Terminal states}{\code{succeeded}; \code{failed} (the plan raised and the RunEngine is idle again);
+            \code{aborted} (safe stop completed); \code{cancelled} (removed while pending);
+            \code{interrupted} (the controller shut down while the attempt was live);
+            \code{unknown} (see below).}
+        \term{Unknown}{The controller cannot \emph{prove} what happened: worker timeout, EOF, process exit,
+            malformed frame, wrong correlation or attempt id, invalid result, or the worker reporting that cleanup
+            did not complete. It is a first-class state, not a kind of failure.}
+        \term{Fail closed}{On any \code{failed}, \code{interrupted} or \code{unknown} outcome: stop the queue
+            execution, create a dispatch block, retry nothing, infer nothing, wait for a human.}
+        \term{Dispatch block}{A durable record that forbids the scheduler from claiming or dispatching.
+            Carries why it exists and whether it \code{requires\_fence}. \code{/ready} answers 503 while one is active.}
+        \term{Fence, fence evidence}{Proof that the previous worker's authority is over. The worker holds an
+            exclusive \code{flock} on a lock file until RunEngine cleanup and process exit; the controller's
+            successful exclusive-lock probe is the evidence, recorded as \code{worker.fenced}.
+            A dead PID or an operator's say-so is not evidence.}
+        \term{Orphan policy}{What the worker does if it loses the controller: today always \code{request-stop},
+            i.e.\ accept no new work, request a RunEngine pause, finish cleanup, release the lock, exit.}
+        \term{Recovery acknowledgement}{\code{POST /recovery/acknowledge} with the lease, the current revision and a
+            note. Clears the dispatch block (only once fence evidence exists when required) and lets a new worker
+            start. Remaining queued work is \emph{not} resumed automatically.}
+        \term{Controller event}{One append-only audit record: monotonic \code{event\_id}, actor
+            (principal / scheduler / system), related UIDs, queue revision, typed payload.
+            Readable after a cursor and streamed over SSE.}
+    \end{terms}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{Reference: phrasebook, \legacy{} $\rightarrow$ \vtwo{}}
+    \scriptsize
+    \renewcommand{\arraystretch}{1.3}
+    \begin{tabular}{@{}L{3.9cm}L{3.9cm}L{5.6cm}@{}}
+        \toprule
+        \textbf{\color{qsamber}\legacy{}} & \textbf{\color{qsnavy}\vtwo{}} & \textbf{What changed} \\
+        \midrule
+        RE Manager + HTTP server & Controller & One process, one authority, one public boundary \\
+        RE Worker (environment) & Worker (worker instance) & Launched only by the controller, only after the previous lock is released \\
+        Watchdog & -- & Removed; systemd supervises the controller, the controller supervises the worker \\
+        Queue item / plan, \code{item\_uid} & Operation, \code{operation\_uid} & Catalogued id + version + schema; UID is stable for life \\
+        Plan execution & Attempt & Separate record; the claim is written before worker contact \\
+        \code{queue\_start}, \code{queue\_autostart} & Queue execution & Durable authorization with initiator, policy and admitted set \\
+        \code{lock} / \code{lock\_key} & Control lease & Bound to a principal and a TTL, not a string \\
+        \code{user}, \code{user\_group} fields & Principal, scopes & Derived from the token by the server \\
+        \code{plan\_queue\_uid} & Queue revision & Required precondition on every mutation \\
+        Plan history & Terminal operations + events & Append-only, with actor and revision \\
+        \code{re\_pause/stop/abort/halt} & Safe stop, stop after current & Narrower on purpose for now \\
+        Failed plan pushed to front & Dispatch block & Nothing is requeued; a human acknowledges \\
+        \code{environment\_destroy} & Fence + recovery acknowledgement & Lock release is the evidence, not the API call \\
+        \code{existing\_plans\_and\_devices.yaml} & Catalog from the worker & Published by code at startup, not generated to a file \\
+        \bottomrule
+    \end{tabular}
+\end{frame}

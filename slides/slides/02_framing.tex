@@ -1,0 +1,122 @@
+% ==========================================================
+% FRAMING
+% ==========================================================
+
+\begin{frame}{What this talk is}
+    \begin{columns}[T]
+        \begin{column}{0.52\textwidth}
+            \footnotesize
+            \textbf{What I did}
+            \begin{itemize}
+                \item Wrote a second-generation queue server, in-tree, next to \legacy{}:
+                      \code{bluesky\_queueserver.v2}
+                \item Kept the shape you designed: one controller, one Bluesky worker process,
+                      an editable persistent queue
+                \item Changed the \emph{contracts}: identity, operation surface, concurrency,
+                      failure handling, recovery
+            \end{itemize}
+            \vspace{0.3cm}
+            \textbf{What I am asking for today}
+            \begin{itemize}
+                \item Agreement, or disagreement, on a short list of properties
+                      I think \emph{any} Bluesky queue server needs
+                \item Technical review of \vtwo{} as a candidate for the next major version
+                \item Not a decision. Nothing shown here is approved for hardware.
+            \end{itemize}
+        \end{column}
+        \begin{column}{0.44\textwidth}
+            \begin{block}{Ground rules I set for myself}
+                \footnotesize
+                \begin{itemize}
+                    \item Compare mechanisms, not people. Every \legacy{} statement
+                          cites a file and line in \code{manager/}, \code{bluesky-httpserver} or
+                          \code{bluesky-queueserver-api}.
+                    \item Where \legacy{} already does the right thing, say so.
+                    \item Where \vtwo{} is incomplete, say so.
+                    \item Everything in the demo runs against \code{ophyd.sim} only.
+                \end{itemize}
+            \end{block}
+            \vspace{0.2cm}
+            {\small\color{qsgray} Agenda: what 0.x got right $\rightarrow$ observations $\rightarrow$
+            eight properties $\rightarrow$ architecture $\rightarrow$ live demo $\rightarrow$ status,
+            costs, open questions. A glossary and a 0.x\,$\rightarrow$\,V2 phrasebook are in the backup slides.\par}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+\begin{frame}{What \legacy{} got right -- and \vtwo{} keeps}
+    \begin{columns}[T]
+        \begin{column}{0.5\textwidth}
+            \begin{exampleblock}{Load-bearing ideas}
+                \footnotesize
+                \begin{itemize}
+                    \item \textbf{Manager / worker split.} Bluesky and Ophyd run in a separate process
+                          from the thing that owns the queue.
+                          \src{start\_manager.py:52-61}
+                    \item \textbf{A persistent, editable queue.} Add, replace, move, remove;
+                          survives a manager restart.
+                          \src{plan\_queue\_ops.py:85-96}
+                    \item \textbf{Worker environment from startup scripts} loaded in lexical order,
+                          exactly like an IPython profile.
+                    \item \textbf{Permissions as a concept}: not every user should reach every plan or device.
+                    \item \textbf{Plan annotations and item validation} before execution.
+                    \item \textbf{An HTTP edge with real authentication} (API keys, OIDC, LDAP, PAM, \ldots)
+                          in \code{bluesky-httpserver}.
+                \end{itemize}
+            \end{exampleblock}
+        \end{column}
+        \begin{column}{0.46\textwidth}
+            \footnotesize
+            \textbf{What \vtwo{} carries forward}
+            \begin{itemize}
+                \item Controller $\neq$ worker; the worker owns the RunEngine and devices
+                \item Durable queue, editable while running
+                \item Profile-style startup directory, lexical order, IPython shell
+                \item Scope-based authorization at the public edge
+                \item Validation before anything is persisted
+            \end{itemize}
+            \vspace{0.2cm}
+            \textbf{What \vtwo{} changes}
+            \begin{itemize}
+                \item \emph{Where} identity is established and \emph{who} trusts it
+                \item \emph{What} a client may ask for
+                \item \emph{How} the queue, the scheduler and the audit trail agree
+                \item \emph{What happens} when the outcome of a plan cannot be proven
+            \end{itemize}
+            \vspace{0.15cm}
+            {\color{qsgray} Years of beamline mileage went into 0.x. \vtwo{} tries to write down what
+            that mileage taught us as contracts the code enforces.}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+\begin{frame}{Observations that led to a rewrite rather than a patch}
+    \small
+    \begin{enumerate}
+        \item \textbf{Identity is a request field.} The manager contract is \code{\{method, params\}};
+              \code{user} and \code{user\_group} are supplied by the client and only checked for
+              existence of the group. \src{manager.py:3759-3770, 2209-2222}
+              The HTTP server fills them in from a real principal \src{routers/core\_api.py:201-212},
+              but any 0MQ client fills them in itself. \src{qserver\_cli.py:49-50}
+        \item \textbf{The public API is the worker namespace.} Plan names and dotted device paths
+              resolve by \code{getattr} \src{profile\_ops.py:785-830, 993-1048};
+              \code{function\_execute} calls allowed callables; \code{script\_upload} executes a
+              client-supplied string in the worker. \src{worker.py:815-889}
+              Allow/deny lists narrow the surface, but the surface \emph{is} the namespace.
+        \item \textbf{Locks are strings, not principals.} \code{lock\_key} is chosen by the client;
+              \code{unlock} accepts only the key. \src{manager.py:3458-3490, 3560-3575}
+        \item \textbf{No concurrency contract on the queue.} \code{plan\_queue\_uid} is documented as
+              informational; mutating calls take no expected version; last write wins.
+              \src{plan\_queue\_ops.py:140-148}
+        \item \textbf{Failure is rounded to ``retry''.} A failed, aborted or halted plan is pushed back to
+              the \emph{front} of the queue with a new UID. \src{plan\_queue\_ops.py:1823-1859}
+              A hard worker death has no recorded outcome path I could find. \src{manager.py:741-760, 1544-1550}
+        \item \textbf{Clients poll.} Status every 1\,s, then reload queue/history when UIDs change.
+              \src{api\_threads.py:66-149, 468-488; \_defaults.py:1-23}
+        \item \textbf{Three repositories, unpinned against each other.}
+              \src{bluesky-httpserver/pyproject.toml:16-19, bluesky-queueserver-api/pyproject.toml:16-19}
+    \end{enumerate}
+    \vspace{0.1cm}
+    {\color{qsgray} Each of these is fixable in isolation. Together they are the design; changing them
+    changes every public contract, which is why I think the honest shape is a major version, not a patch series.}
+\end{frame}

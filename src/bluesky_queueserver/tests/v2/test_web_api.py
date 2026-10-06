@@ -264,6 +264,19 @@ def test_http_api_authentication_etag_idempotency_and_surface(tmp_path):
             assert actor_injection.status_code == 422
             assert (await client.get("/api/v2/queue", headers=read_headers)).headers["etag"] == '"qrev-2"'
 
+            for key, body in (
+                ("operation-uncatalogued", {**submission, "operation_id": "execute_plan"}),
+                ("operation-out-of-schema", {**submission, "parameters": {"detectors": ["det"], "num": 11}}),
+            ):
+                rejected = await client.post(
+                    "/api/v2/operations",
+                    headers={**control_headers, "Idempotency-Key": key, "If-Match": '"qrev-2"'},
+                    json=body,
+                )
+                assert rejected.status_code == 422, rejected.text
+                assert rejected.json()["error"]["code"] == "validation_error"
+            assert (await client.get("/api/v2/queue", headers=read_headers)).headers["etag"] == '"qrev-2"'
+
             specification = await client.get("/api/v2/openapi.json", headers=read_headers)
             assert specification.status_code == 200
             paths = set(specification.json()["paths"])

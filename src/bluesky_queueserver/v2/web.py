@@ -17,6 +17,7 @@ from .contracts import (
     AttemptView,
     AuthorizationScope,
     CatalogView,
+    ContractValidationError,
     ControlLeaseView,
     ErrorBody,
     ErrorResponse,
@@ -130,6 +131,10 @@ def create_app(
     @app.exception_handler(MissingIdempotencyKeyError)
     async def invalid_request(request: Request, exc: Exception):
         return error_response(request, status=422, code="invalid_request", message=str(exc))
+
+    @app.exception_handler(ContractValidationError)
+    async def contract_violation(request: Request, exc: ContractValidationError):
+        return error_response(request, status=422, code="validation_error", message=str(exc))
 
     @app.exception_handler(RequestValidationError)
     async def request_validation(request: Request, exc: RequestValidationError):
