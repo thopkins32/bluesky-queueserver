@@ -1,0 +1,53 @@
+% Preamble for pandoc -> tectonic builds of the V2 planning documents.
+\usepackage{fontspec}
+% Fonts come from the pixi environment (fonts-conda-forge, font-ttf-dejavu); the
+% build script sets FONTDIR to that directory. No system fonts are assumed.
+\setmainfont{DejaVuSerif}[
+  Path=\fontdir/, Extension=.ttf,
+  UprightFont=*, BoldFont=*-Bold, ItalicFont=*-Italic, BoldItalicFont=*-BoldItalic]
+\setsansfont{DejaVuSans}[
+  Path=\fontdir/, Extension=.ttf,
+  UprightFont=*, BoldFont=*-Bold, ItalicFont=*-Oblique, BoldItalicFont=*-BoldOblique]
+\setmonofont{DejaVuSansMono}[
+  Path=\fontdir/, Extension=.ttf, Scale=MatchLowercase,
+  UprightFont=*, BoldFont=*-Bold, ItalicFont=*-Oblique, BoldItalicFont=*-BoldOblique]
+\usepackage{microtype}
+\usepackage{xcolor}
+\definecolor{codebg}{RGB}{245,245,245}
+\definecolor{rulegray}{RGB}{200,200,200}
+% Wrap long code blocks instead of overflowing the margin; allow inline code to
+% break at punctuation.
+\usepackage{fvextra}
+\DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,breakanywhere,commandchars=\\\{\},fontsize=\footnotesize}
+\fvset{breaklines=true,breakanywhere=true}
+% Shaded background behind both highlighted and plain code blocks. Pandoc defines
+% Shaded only when a document contains highlighted code, so (re)define it ourselves.
+\usepackage{framed}
+\definecolor{shadecolor}{RGB}{245,245,245}
+\makeatletter
+\@ifundefined{Shaded}{\newenvironment{Shaded}{\begin{snugshade}}{\end{snugshade}}}{\renewenvironment{Shaded}{\begin{snugshade}}{\end{snugshade}}}
+\makeatother
+\AtBeginEnvironment{verbatim}{\footnotesize}
+% Let XeTeX break long inline code (paths, identifiers) rather than overflow.
+\XeTeXlinebreaklocale "en"
+\XeTeXlinebreakskip=0pt plus 1pt
+\sloppy
+% Tables: allow long cells to wrap; thin rules.
+\usepackage{longtable,booktabs,array}
+\setlength{\LTpre}{6pt}\setlength{\LTpost}{6pt}
+\usepackage{etoolbox}
+\AtBeginEnvironment{longtable}{\small}
+% Headings
+\usepackage{titlesec}
+\titleformat{\section}{\Large\bfseries\sffamily}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\large\bfseries\sffamily}{\thesubsection}{0.6em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries\sffamily}{\thesubsubsection}{0.6em}{}
+\titlespacing*{\section}{0pt}{14pt}{6pt}
+\titlespacing*{\subsection}{0pt}{10pt}{4pt}
+\titlespacing*{\subsubsection}{0pt}{8pt}{3pt}
+% Block quotes as a shaded box
+\usepackage{mdframed}
+\renewenvironment{quote}{\begin{mdframed}[backgroundcolor=codebg,linecolor=rulegray,linewidth=0.5pt,innerleftmargin=8pt,innerrightmargin=8pt]}{\end{mdframed}}
+% Figures float to the top of the current or next page; never to the end.
+\usepackage{float}
+\floatplacement{figure}{!htb}

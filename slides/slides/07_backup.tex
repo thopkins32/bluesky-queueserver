@@ -5,6 +5,99 @@
 \divider{Backup}{reference material}
 
 % ----------------------------------------------------------
+\begin{frame}{Backup: ``isn't that what the watchdog is for?'' (1/2)}
+    \framesubtitle{Yes -- for one failure class. The disagreement is about which question it answers.}
+    \begin{columns}[T]
+        \begin{column}{0.42\textwidth}
+            \begin{exampleblock}{What the watchdog does, and does well}
+                \scriptsize
+                \begin{itemize}
+                    \item Lives in the \code{start-re-manager} process; owns the pipes; spawns the manager
+                          at start and the worker on the manager's request.
+                          \src{start\_manager.py:60-79, 98-117, 169-182}
+                    \item The manager heartbeats every 0.5\,s; after a $\geq$5\,s gap the watchdog kills and
+                          respawns the manager, and only the manager.
+                          \src{manager.py:356-364; start\_manager.py:69, 217-221}
+                    \item The worker is untouched, so a plan survives a manager bug. The new manager asks
+                          the watchdog whether the worker is alive and reloads plans, devices, run list and
+                          RE state from the worker. \src{manager.py:3882-3925}
+                    \item This is the right tool for ``the manager's event loop died while the plan was
+                          fine''. \vtwo{} does not claim otherwise.
+                \end{itemize}
+            \end{exampleblock}
+        \end{column}
+        \begin{column}{0.56\textwidth}
+            \begin{alertblock}{What it does not cover}
+                \scriptsize
+                \begin{enumerate}
+                    \item \textbf{Host and deployment restarts.} When \code{start-re-manager} exits
+                          (reboot, OOM, upgrade, \code{systemctl restart}) its exit handlers kill the worker
+                          and the manager. It survives the manager, not the host, so a fail-closed path is
+                          needed anyway; the watchdog is a \emph{second} path for one failure class.
+                          \src{start\_manager.py:860-868}
+                    \item \textbf{Liveness, not state.} It knows the worker PID is alive; it cannot say what
+                          the worker did while the manager was gone. The restarted manager infers its state
+                          from the worker's self-report. If the item UID in Redis and the worker's disagree,
+                          it logs a warning and carries on (``Guess is that the environment may still work'');
+                          if no state matches, the item is recorded as \code{exit\_status="unknown"},
+                          ``Plan exit status was lost due to restart''. \src{manager.py:3926-3937, 3950-3958}
+                    \item \textbf{No orphan policy, and a gap in the restart loop.} While the manager is down
+                          the plan continues and nothing can stop it through the API. After a restart the
+                          watchdog is disabled until the new manager reports initialization complete; a manager
+                          that dies \emph{during} initialization (Redis unreachable, startup exception) is never
+                          restarted, and the worker runs on unsupervised.
+                          \src{start\_manager.py:94-95, 171, 208-209; manager.py:3977-3978}
+                \end{enumerate}
+            \end{alertblock}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+% ----------------------------------------------------------
+\begin{frame}{Backup: ``isn't that what the watchdog is for?'' (2/2)}
+    \framesubtitle{Reattachment and one authority cannot both hold; each design picks one}
+    \begin{columns}[T]
+        \begin{column}{0.5\textwidth}
+            \begin{alertblock}{\legacy{}: continuity, four places where the truth lives}
+                \scriptsize
+                \begin{itemize}
+                    \item Redis holds the queue and the running item.
+                    \item The restarted manager holds a reconstruction.
+                    \item The worker holds RE state and its run list.
+                    \item The watchdog holds the PIDs.
+                \end{itemize}
+                \vspace{0.1cm}
+                Reattachment \emph{requires} the worker to act as an authority during the gap: it keeps
+                driving hardware, and the system later reconciles by inference. That buys plan continuity
+                on a manager crash.
+            \end{alertblock}
+        \end{column}
+        \begin{column}{0.48\textwidth}
+            \begin{block}{\vtwo{}: one authority, a defined response to losing it}
+                \scriptsize
+                \begin{itemize}
+                    \item systemd restarts the controller: \code{Restart=on-failure}, \code{KillMode=process},
+                          \code{SendSIGKILL=no}, \code{TimeoutStopSec=infinity} so worker cleanup completes.
+                          \src{deployment/v2/bluesky-queueserver-v2.service}
+                    \item On controller loss the worker accepts no new work, pauses the RunEngine at the next
+                          checkpoint, finishes cleanup, releases its lock and exits.
+                          \src{v2/worker/runtime.py:214-239}
+                    \item The attempt becomes \code{unknown} or \code{interrupted}; dispatch blocks; the lock
+                          release is the fence evidence; an operator acknowledges.
+                \end{itemize}
+                \vspace{0.1cm}
+                The honest cost: a controller crash ends the plan at its next checkpoint.
+            \end{block}
+        \end{column}
+    \end{columns}
+    \vspace{0.05cm}
+    {\footnotesize\color{qsgray} The question that decides it: \textbf{how often, in production, does the manager
+    die mid-plan while the worker is healthy?} If often, that is evidence for designing reattachment in a later
+    release; if rarely, the watchdog buys continuity for a rare event at the price of a permanent second truth.
+    Reattachment is deferred, not forbidden.\par}
+\end{frame}
+
+% ----------------------------------------------------------
 \begin{frame}{Backup: public HTTP surface}
     \footnotesize
     \begin{columns}[T]
