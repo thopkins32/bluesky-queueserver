@@ -5,13 +5,10 @@ Release History
 Unreleased
 ==========
 
-Added
------
+Removed
+-------
 
-- Additive QueueServer V2 simulator service with strict operation contracts,
-  transactional SQLite state, authenticated HTTPS/SSE APIs, private worker
-  isolation, fencing, recovery, and offline administration. Existing
-  QueueServer ``0.x`` interfaces remain unchanged.
+- Support for Python 3.10. The minimum supported Python version is now 3.11.
 
 
 v0.0.25 (2026-07-16)

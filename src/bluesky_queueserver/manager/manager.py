@@ -1,7 +1,6 @@
 import asyncio
 import copy
 import enum
-import json
 import logging
 import time as ttime
 import uuid
@@ -1276,7 +1275,7 @@ class RunEngineManager(Process):
 
             try:
                 await asyncio.wait_for(self._queue_autostart_event.wait(), timeout=polling_period)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
             self._queue_autostart_event.clear()
@@ -1831,7 +1830,7 @@ class RunEngineManager(Process):
         try:
             response = await self._comm_to_watchdog.send_msg("is_worker_alive")
             worker_alive = response["worker_alive"]
-        except asyncio.TimeoutError:
+        except TimeoutError:
             worker_alive = False
         return worker_alive
 
@@ -3379,23 +3378,12 @@ class RunEngineManager(Process):
             self._check_request_for_unsupported_params(request=request, param_names=[])
 
             if self._environment_exists:
+                # Metadata is expected to be JSON serializable (checked in the worker)
                 re_metadata, msg = await self._worker_request_runengine_metadata()
 
                 if re_metadata is None:
                     success, re_metadata = False, {}
-                else:
-                    # Make sure the metadata is serializable given the encoding
-                    try:
-                        if self._zmq_encoding == ZMQEncoding.JSON:
-                            json.dumps(re_metadata)
-                        else:
-                            msgpack.packb(re_metadata)
-                    except Exception as ex:
-                        success, msg, re_metadata = (
-                            False,
-                            f"Failed to serialize RE metadata with {self._zmq_encoding.name}: {ex}",
-                            {},
-                        )
+
             else:
                 success, msg, re_metadata = (
                     False,

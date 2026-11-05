@@ -206,7 +206,7 @@ class RunEngineWorker(Process):
         self._run_reg_cb = None  # Callback for RE
 
         self._re_namespace, self._plans_in_nspace, self._devices_in_nspace = {}, {}, {}
-        self._permitted_re_metadata_keys = set(self._config_dict.get("permitted_re_metadata_keys", ["/"]))
+        self._permitted_re_metadata_keys = set(self._config_dict.get("permitted_re_metadata_keys", []))
 
         self._worker_shutdown_initiated = False  # Indicates if shutdown is initiated by request
         self._unexpected_shutdown = False  # Indicates if shutdown is in progress, but it was not requested
@@ -500,7 +500,14 @@ class RunEngineWorker(Process):
             plan_func = plan_parsed["callable"]
             plan_args_parsed = plan_parsed["args"]
             plan_kwargs_parsed = plan_parsed["kwargs"]
-            plan_meta_parsed = plan_parsed["meta"]
+            plan_meta_parsed = {**plan_parsed["meta"]}
+            submitted_queue_server_meta = plan_meta_parsed.get("queue_server")
+            if not isinstance(submitted_queue_server_meta, dict):
+                submitted_queue_server_meta = {}
+            plan_meta_parsed["queue_server"] = {
+                **submitted_queue_server_meta,
+                "queue_item_uid": plan_info["item_uid"],
+            }
 
             if self.re_state == "panicked":
                 raise RuntimeError(
@@ -1018,7 +1025,14 @@ class RunEngineWorker(Process):
             raise AttributeError("Run Engine does not have a metadata attribute")
 
         try:
-            return filter_dict_by_permitted_keys(dict(self._RE.md), self._permitted_re_metadata_keys)
+            if not self._permitted_re_metadata_keys:
+                raise RuntimeError("Permitted RE metadata keys are not set")
+
+            md = copy.deepcopy(self._RE.md)
+            md_filtered = filter_dict_by_permitted_keys(md, self._permitted_re_metadata_keys)
+            # Make sure the result is JSON-serializable. It is assumed that 'md_filtered' is small.
+            json.dumps(md_filtered)
+            return md_filtered
         except Exception as ex:
             raise RuntimeError(f"Failed to convert Run Engine metadata to dictionary: {ex}") from ex
 
@@ -1418,7 +1432,7 @@ class RunEngineWorker(Process):
 
         from bluesky.run_engine import get_bluesky_event_loop
 
-        # Setting the default event loop is needed to make the code work with Python 3.8.
+        # Set the Bluesky event loop as the default loop for the worker process.
         loop = get_bluesky_event_loop() or asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
