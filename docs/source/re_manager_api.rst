@@ -345,6 +345,10 @@ Returns       **msg**: *str*
 
                   - **queue** (*boolean*) - indicates if the queue is locked. See the **lock** API
                     for details.
+
+              **controller_fronted**: *boolean*
+                  indicates if RE Manager runs in controller-fronted mode (see the
+                  ``controller_fronted`` configuration parameter).
 ------------  -----------------------------------------------------------------------------------------
 Execution     Immediate: no follow-up requests are required.
 ============  =========================================================================================

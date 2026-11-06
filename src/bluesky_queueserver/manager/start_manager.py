@@ -445,6 +445,19 @@ def start_manager():
     )
 
     parser.add_argument(
+        "--controller-fronted",
+        dest="controller_fronted",
+        type=str,
+        choices=["ON", "OFF"],
+        default="OFF",
+        help="Enable (ON) or disable (OFF) controller-fronted mode, in which a controller (such as "
+        "bluesky-httpserver 2.x) owns the queue and is the only client of RE Manager. In this mode RE Manager "
+        "refuses to start unless the control and info addresses are 'ipc://' paths and rejects the requests "
+        "that edit or start the queue, upload scripts, execute functions, change permissions, update "
+        "the environment or lock RE Manager (default: %(default)s).",
+    )
+
+    parser.add_argument(
         "--redis-addr",
         dest="redis_addr",
         type=str,
@@ -684,6 +697,15 @@ def start_manager():
 
     settings = Settings(parser=parser, args=args)
 
+    # Check before any socket is bound: in controller-fronted mode only the processes that can access
+    #   the 'ipc://' paths may connect to RE Manager.
+    if settings.controller_fronted:
+        for name in ("zmq_control_addr", "zmq_info_addr"):
+            address = getattr(settings, name)
+            if not address.startswith("ipc://"):
+                logger.error("Controller-fronted mode requires an 'ipc://' address: %s=%r", name, address)
+                return 1
+
     msg_queue = Queue()
     setup_console_output_redirection(msg_queue)
 
@@ -851,6 +873,7 @@ def start_manager():
     config_manager["use_ipython_kernel"] = settings.use_ipython_kernel
 
     config_manager["lock_key_emergency"] = settings.emergency_lock_key
+    config_manager["controller_fronted"] = settings.controller_fronted
 
     wp = WatchdogProcess(
         config_worker=config_worker, config_manager=config_manager, msg_queue=msg_queue, log_level=log_level

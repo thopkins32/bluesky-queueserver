@@ -14,6 +14,12 @@ Added
   returned by ``plans_existing`` and ``plans_allowed`` API. Generating the list of existing plans fails
   if two plans define the same operation.
 
+- New ``controller_fronted`` configuration parameter (``--controller-fronted`` CLI parameter). In
+  controller-fronted mode RE Manager refuses to start unless the control and info addresses are
+  ``ipc://`` paths and rejects the requests that edit or start the queue, upload scripts, execute
+  functions, change permissions, update the environment or lock RE Manager. RE Manager status
+  includes the new ``controller_fronted`` field.
+
 Fixed
 -----
 

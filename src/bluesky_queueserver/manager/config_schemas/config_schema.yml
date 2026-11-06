@@ -330,3 +330,5 @@ properties:
         pattern: "^(NEVER)|(ON_REQUEST)|(ON_STARTUP)"
       emergency_lock_key:
         type: string
+      controller_fronted:
+        type: boolean

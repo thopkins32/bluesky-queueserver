@@ -176,6 +176,7 @@ operation:
   update_existing_plans_and_devices: ENVIRONMENT_OPEN
   user_group_permissions_reload: ON_REQUEST
   emergency_lock_key: some_lock_key
+  controller_fronted: true
 worker:
   use_ipython_kernel: true
   ipython_kernel_ip: auto
@@ -218,6 +219,7 @@ operation:
   update_existing_plans_and_devices: ENVIRONMENT_OPEN
   user_group_permissions_reload: ON_REQUEST
   emergency_lock_key: some_lock_key
+  controller_fronted: true
 """
 
 config_01d_success = """
@@ -259,6 +261,7 @@ config_01_dict = {
         "update_existing_plans_and_devices": "ENVIRONMENT_OPEN",
         "user_group_permissions_reload": "ON_REQUEST",
         "emergency_lock_key": "some_lock_key",
+        "controller_fronted": True,
     },
     "worker": {
         "use_ipython_kernel": True,

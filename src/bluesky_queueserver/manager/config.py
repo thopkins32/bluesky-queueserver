@@ -214,6 +214,7 @@ _key_mapping = {
     "update_existing_plans_devices": "operation/update_existing_plans_and_devices",
     "user_group_permissions_reload": "operation/user_group_permissions_reload",
     "emergency_lock_key": "operation/emergency_lock_key",
+    "controller_fronted": "operation/controller_fronted",
 }
 
 
@@ -575,6 +576,12 @@ class Settings:
         self._settings["emergency_lock_key"] = self._get_param(
             value_ev=os.environ.get("QSERVER_EMERGENCY_LOCK_KEY_FOR_SERVER", None),
             value_config=self._get_value_from_config("emergency_lock_key"),
+        )
+
+        self._settings["controller_fronted"] = self._get_param_boolean(
+            value_default=args.controller_fronted,
+            value_config=self._get_value_from_config("controller_fronted"),
+            value_cli=self._args_existing("controller_fronted"),
         )
 
     def __getattr__(self, attr):

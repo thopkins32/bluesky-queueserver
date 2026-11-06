@@ -12,6 +12,7 @@ from bluesky_queueserver import gen_list_of_plans_and_devices
 from bluesky_queueserver.manager.config import default_existing_pd_fln, default_user_group_pd_fln
 
 from .common import (
+    ReManager,
     _test_redis_name_prefix,
     _user,
     _user_group,
@@ -461,6 +462,101 @@ def test_cli_parameters_zmq_server_address_1(monkeypatch, re_manager_cmd, test_m
         assert status is None, (status, msg)
 
 
+# fmt: off
+@pytest.mark.parametrize("ipc_addresses", [[], ["control"], ["info"]])
+# fmt: on
+def test_cli_controller_fronted_01_fail(tmp_path, ipc_addresses):
+    """
+    RE Manager refuses to start in controller-fronted mode unless both the control and
+    the info addresses are 'ipc://' paths.
+    """
+    params = [f"--zmq-{_}-addr=ipc://{tmp_path}/{_}" for _ in ipc_addresses]
+    p = subprocess.run(
+        ["start-re-manager", "--controller-fronted=ON", *params], capture_output=True, text=True, timeout=30
+    )
+    output = p.stdout + p.stderr
+    assert p.returncode == 1, output
+    assert "Controller-fronted mode requires an 'ipc://' address" in output, output
+
+
+def test_cli_controller_fronted_02(monkeypatch, tmp_path):
+    """
+    Controller-fronted mode: the requests that edit or start the queue, upload scripts, execute
+    functions, change permissions, update the environment or lock RE Manager are rejected and
+    change nothing. Plans are executed with 'queue_item_execute'.
+    """
+    control_addr, info_addr = f"ipc://{tmp_path}/control", f"ipc://{tmp_path}/info"
+    set_qserver_zmq_address(monkeypatch, zmq_server_address=control_addr)
+
+    def request(method, params=None):
+        resp, msg = zmq_request(method, params, zmq_server_address=control_addr)
+        assert resp is not None, msg
+        return resp
+
+    def state(status):
+        keys = ("items_in_queue", "plan_queue_uid", "plans_allowed_uid", "lock_info_uid", "plan_queue_mode")
+        return {_: status[_] for _ in keys + ("queue_autostart_enabled", "lock", "manager_state")}
+
+    item = {"name": "count", "args": [["det1", "det2"]], "item_type": "plan"}
+    user = {"user": _user, "user_group": _user_group}
+    disabled = {
+        "queue_item_add": {"item": item, **user},
+        "queue_item_add_batch": {"items": [item], **user},
+        "queue_item_update": {"item": item, **user},
+        "queue_item_move": {"pos": 0, "pos_dest": 1},
+        "queue_item_move_batch": {"uids": [], "pos_dest": "front"},
+        "queue_item_remove": {"pos": "back"},
+        "queue_item_remove_batch": {"uids": []},
+        "queue_clear": {},
+        "queue_start": {},
+        "queue_stop": {},
+        "queue_autostart": {"enable": True},
+        "queue_mode_set": {"mode": {"loop": True}},
+        "script_upload": {"script": "a = 10"},
+        "function_execute": {"item": {"name": "function_sleep", "item_type": "function"}, **user},
+        "permissions_set": {"user_group_permissions": {}},
+        "permissions_reload": {},
+        "environment_update": {},
+        "lock": {"environment": True, "queue": True, "lock_key": "key"},
+        "unlock": {"lock_key": "key"},
+    }
+
+    # 're_manager_cmd' fixture can not be used: it calls 'queue_mode_set' after the manager is started.
+    params = ["--controller-fronted=ON", f"--zmq-control-addr={control_addr}", f"--zmq-info-addr={info_addr}"]
+    re_manager = ReManager(params)
+    try:
+        assert wait_for_condition(time=10, condition=condition_manager_idle), "RE Manager failed to start"
+
+        status = request("status")
+        assert status["controller_fronted"] is True
+
+        rejected = {"success": False, "msg": "disabled in controller-fronted mode"}
+        for method, params in disabled.items():
+            assert request(method, params) == rejected, method
+
+        assert state(request("status")) == state(status)
+
+        resp1 = request("environment_open")
+        assert resp1["success"] is True, resp1
+        assert wait_for_condition(time=timeout_env_open, condition=condition_environment_created)
+
+        resp2 = request("queue_item_execute", {"item": item, **user})
+        assert resp2["success"] is True, resp2
+        assert wait_for_condition(
+            time=30, condition=lambda status: status["items_in_history"] == 1 and status["manager_state"] == "idle"
+        )
+
+        (history_item,) = request("history_get")["items"]
+        assert history_item["item_uid"] == resp2["item"]["item_uid"]
+        assert history_item["result"]["exit_status"] == "completed"
+
+        resp3 = request("environment_close")
+        assert resp3["success"] is True, resp3
+        assert wait_for_condition(time=5, condition=condition_environment_closed)
+    finally:
+        re_manager.stop_manager()
+
+
 def _get_expected_settings_default_1(_1, _2):
     use_ip_kernel = use_ipykernel_for_tests()
     username = getpass.getuser()
@@ -481,6 +577,7 @@ def _get_expected_settings_default_1(_1, _2):
 
     return {
         "console_logging_level": 10,
+        "controller_fronted": False,
         "demo_mode": True,
         "emergency_lock_key": None,
         "existing_plans_and_devices_path": existing_plans_and_devices_path,
@@ -588,6 +685,7 @@ def _get_expected_settings_config_2(file_dir, ip_con_dir):
 
     return {
         "console_logging_level": 10,
+        "controller_fronted": False,
         "demo_mode": False,
         "emergency_lock_key": "different_lock_key",
         "existing_plans_and_devices_path": existing_plans_and_devices_path,
@@ -686,6 +784,7 @@ def _get_expected_settings_params_3(file_dir, _):
 
     return {
         "console_logging_level": 10,
+        "controller_fronted": False,
         "demo_mode": False,
         "emergency_lock_key": "different_lock_key",
         "existing_plans_and_devices_path": existing_plans_and_devices_path,

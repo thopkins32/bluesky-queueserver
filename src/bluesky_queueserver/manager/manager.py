@@ -58,6 +58,33 @@ class MState(enum.Enum):
     DESTROYING_ENVIRONMENT = "destroying_environment"
 
 
+# Requests rejected in controller-fronted mode: the controller owns the queue, and nobody may run
+#   arbitrary code, change permissions or lock RE Manager.
+_methods_disabled_in_controller_fronted_mode = frozenset(
+    {
+        "queue_item_add",
+        "queue_item_add_batch",
+        "queue_item_update",
+        "queue_item_move",
+        "queue_item_move_batch",
+        "queue_item_remove",
+        "queue_item_remove_batch",
+        "queue_clear",
+        "queue_start",
+        "queue_stop",
+        "queue_autostart",
+        "queue_mode_set",
+        "script_upload",
+        "function_execute",
+        "permissions_set",
+        "permissions_reload",
+        "environment_update",
+        "lock",
+        "unlock",
+    }
+)
+
+
 class LockInfo:
     def __init__(self):
         self._lock_key_emergency = None
@@ -292,6 +319,7 @@ class RunEngineManager(Process):
         self._comm_to_worker = None
 
         self._use_ipython_kernel = config["use_ipython_kernel"]
+        self._controller_fronted = config["controller_fronted"]
 
         # Note: 'self._config' is a private attribute of 'multiprocessing.Process'. Overriding
         #   this variable may lead to unpredictable and hard to debug issues.
@@ -444,6 +472,7 @@ class RunEngineManager(Process):
             "task_results_uid": self._task_results.task_results_uid,
             "lock_info_uid": self._lock_info.uid,
             "lock": {"environment": self._lock_info.environment, "queue": self._lock_info.queue},
+            "controller_fronted": self._controller_fronted,
         }
 
         self._status_publish()  # Add the updated status to 'msg_queue'
@@ -3779,7 +3808,10 @@ class RunEngineManager(Process):
 
             handler_name = handler_dict[method]
             handler = getattr(self, handler_name)
-            result = await handler(params)
+            if self._controller_fronted and (method in _methods_disabled_in_controller_fronted_mode):
+                result = {"success": False, "msg": "disabled in controller-fronted mode"}
+            else:
+                result = await handler(params)
         except KeyError:
             result = {"success": False, "msg": f"Unknown method {method!r}"}
         except AttributeError:

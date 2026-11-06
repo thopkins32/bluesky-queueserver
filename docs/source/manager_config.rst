@@ -144,6 +144,7 @@ most of the supported parameters:
       update_existing_plans_and_devices: ENVIRONMENT_OPEN
       user_group_permissions_reload: ON_REQUEST
       emergency_lock_key: custom_lock_key
+      controller_fronted: false
     worker:
       use_ipython_kernel: true
       ipython_kernel_ip: auto
@@ -266,6 +267,18 @@ The parameters that define run-time behavior of RE Manager:
 - ``emergency_lock_key`` - emergency lock key used to unlock RE Manager if the lock key set by
   a user is lost. The key may also be set using environment variable
   ``QSERVER_EMERGENCY_LOCK_KEY_FOR_SERVER``.
+
+- ``controller_fronted`` - enables (``true``) or disables (``false``, default) controller-fronted
+  mode, in which a controller (such as ``bluesky-httpserver`` 2.x) owns the queue and is the only
+  client of RE Manager. In this mode RE Manager refuses to start unless ``zmq_control_addr`` and
+  ``zmq_info_addr`` are ``ipc://`` paths, so only the processes that can access the paths may
+  connect. The requests ``queue_item_add``, ``queue_item_add_batch``, ``queue_item_update``,
+  ``queue_item_move``, ``queue_item_move_batch``, ``queue_item_remove``, ``queue_item_remove_batch``,
+  ``queue_clear``, ``queue_start``, ``queue_stop``, ``queue_autostart``, ``queue_mode_set``,
+  ``script_upload``, ``function_execute``, ``permissions_set``, ``permissions_reload``,
+  ``environment_update``, ``lock`` and ``unlock`` are rejected with the message
+  ``'disabled in controller-fronted mode'`` and change nothing. The controller runs plans using
+  ``queue_item_execute``. The value may also be set using ``--controller-fronted`` CLI parameter.
 
 .. _config_file_worker:
 

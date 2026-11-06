@@ -208,6 +208,7 @@ Other Configuration Parameters
                           [--update-existing-plans-devices {NEVER,ENVIRONMENT_OPEN,ALWAYS}]
                           [--user-group-permissions USER_GROUP_PERMISSIONS_PATH]
                           [--user-group-permissions-reload {NEVER,ON_REQUEST,ON_STARTUP}]
+                          [--controller-fronted {ON,OFF}]
                           [--redis-addr REDIS_ADDR] [--redis-name-prefix REDIS_NAME_PREFIX]
                           [--use-ipython-kernel {ON,OFF}] [--ipython-dir IPYTHON_DIR]
                           [--ipython-matplotlib IPYTHON_MATPLOTLIB]
@@ -323,6 +324,14 @@ Other Configuration Parameters
                       'permission_reload' API call. 'ON_STARTUP' - permissions are loaded
                       from disk each time RE Manager is started or when 'permission_reload'
                       API request is received (default: ON_STARTUP)
+    --controller-fronted {ON,OFF}
+                      Enable (ON) or disable (OFF) controller-fronted mode, in which a
+                      controller (such as bluesky-httpserver 2.x) owns the queue and is the
+                      only client of RE Manager. In this mode RE Manager refuses to start
+                      unless the control and info addresses are 'ipc://' paths and rejects
+                      the requests that edit or start the queue, upload scripts, execute
+                      functions, change permissions, update the environment or lock RE
+                      Manager (default: OFF).
     --redis-addr REDIS_ADDR
                       The address of Redis server, e.g. 'localhost', '127.0.0.1',
                       'localhost:6379', 'localhost:6379/0'.(default: localhost).
