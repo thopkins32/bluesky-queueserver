@@ -288,6 +288,61 @@ def test_gen_list_of_plans_and_devices_06(monkeypatch, tmp_path, option, use_ip_
     assert len(devices), pprint.pformat(devices)
 
 
+_script_operation_count = """
+from bluesky_queueserver import operation
+
+@operation(
+    id="demo.count",
+    version="1",
+    request_model={
+        "type": "object",
+        "properties": {"detectors": {"type": "array", "items": {"type": "string"}}},
+        "required": ["detectors"],
+        "additionalProperties": False,
+    },
+    devices={"detectors": {"primary": "det1", "secondary": "det2"}},
+)
+def count_operation(detectors):
+    yield from count(detectors)
+"""
+
+
+def test_gen_list_of_plans_and_devices_07(tmp_path):
+    """
+    ``gen_list_of_plans_and_devices``: the operation descriptor is included in the plan description.
+    Generation fails if two plans define the same operation.
+    """
+    using_ipython = use_ipykernel_for_tests()
+    pp = dict(use_ipython_kernel=using_ipython) if using_ipython else {}
+
+    pc_path = copy_default_profile_collection(tmp_path, copy_yaml=False)
+    append_code_to_last_startup_file(pc_path, _script_operation_count)
+
+    fln_yaml = "list.yaml"
+    fln_yaml_path = os.path.join(pc_path, fln_yaml)
+    gen_list_of_plans_and_devices(startup_dir=pc_path, file_dir=pc_path, file_name=fln_yaml, **pp)
+
+    plans, _ = load_existing_plans_and_devices(fln_yaml_path)
+    assert plans["count_operation"]["operation"] == {
+        "id": "demo.count",
+        "version": "1",
+        "request_schema": {
+            "type": "object",
+            "properties": {"detectors": {"type": "array", "items": {"type": "string"}}},
+            "required": ["detectors"],
+            "additionalProperties": False,
+        },
+        "devices": {"detectors": {"primary": "det1", "secondary": "det2"}},
+    }
+    assert [name for name, plan in plans.items() if "operation" in plan] == ["count_operation"]
+
+    append_code_to_last_startup_file(pc_path, "count_operation_copy = count_operation")
+    msg = "Plans 'count_operation' and 'count_operation_copy' define the same operation 'demo.count' version '1'"
+    pp = dict(startup_dir=pc_path, file_dir=pc_path, file_name=fln_yaml, overwrite=True, **pp)
+    with pytest.raises(RuntimeError, match=msg):
+        gen_list_of_plans_and_devices(**pp)
+
+
 _startup_script_1 = """
 from ophyd.sim import det1, det2
 from bluesky.plans import count

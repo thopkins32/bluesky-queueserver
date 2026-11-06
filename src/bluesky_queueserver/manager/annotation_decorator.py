@@ -1,6 +1,7 @@
 import copy
 import functools
 import inspect
+import json
 
 import jsonschema
 
@@ -62,6 +63,21 @@ _parameter_annotation_schema = {
             },
         },
     },
+}
+
+_operation_descriptor_schema = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1},
+        "request_schema": {"type": "object"},
+        "devices": {
+            "type": "object",
+            "additionalProperties": {"type": "object", "additionalProperties": {"type": "string"}},
+        },
+    },
+    "required": ["id", "version", "request_schema", "devices"],
+    "additionalProperties": False,
 }
 
 
@@ -306,6 +322,105 @@ def parameter_annotation_decorator(annotation):
             raise ValueError(msg)
 
         wrapper._custom_parameter_annotation_ = annotation
+
+        return wrapper
+
+    return function_wrap
+
+
+def operation(*, id, version, request_model, devices=None):
+    """
+    The decorator marks a plan as an operation in the catalog served to a controller (such as
+    ``bluesky-httpserver`` 2.x). Clients of the controller request the operation by ``id`` and
+    ``version`` and pass parameters, which the controller validates against ``request_model``.
+    The controller then executes the plan with the parameters as keyword arguments, replacing
+    the device ids listed in ``devices`` with the names of the devices in RE Worker namespace.
+    RE Worker validates the plan as any other plan.
+
+    The operation descriptor is saved as ``_operation_descriptor_`` attribute of the function. It is
+    included as ``operation`` in the plan description, which is saved to the list of existing plans
+    and devices and returned by ``plans_existing`` and ``plans_allowed`` API. The combination of
+    ``id`` and ``version`` must be unique among the plans in RE Worker namespace.
+
+    .. code-block:: python
+
+        class CountRequest(pydantic.BaseModel):
+            model_config = pydantic.ConfigDict(extra="forbid")
+            detectors: list[str]
+            num: int = pydantic.Field(1, ge=1)
+
+        @operation(
+            id="demo.count",
+            version="1",
+            request_model=CountRequest,
+            devices={"detectors": {"primary": "det1", "secondary": "det2"}},
+        )
+        def count_operation(detectors, num=1):
+            yield from count(detectors, num=num)
+
+    Parameters
+    ----------
+    id: str
+        Identifier of the operation.
+    version: str
+        Version of the operation. Changed parameters require a new version.
+    request_model: pydantic.BaseModel or dict
+        Pydantic model or JSON Schema (draft 2020-12) of the parameters. The schema must set
+        ``additionalProperties`` to ``False``. Each property must be a parameter of the function.
+    devices: dict or None
+        Maps names of the function parameters to dictionaries, which map the device ids clients
+        may pass to the names of the devices in RE Worker namespace.
+
+    Raises
+    ------
+    TypeError
+        The schema contains objects that are not JSON values.
+    jsonschema.ValidationError
+        ``id``, ``version`` or ``devices`` has incorrect format.
+    jsonschema.SchemaError
+        The schema is not valid JSON Schema.
+    ValueError
+        The schema contains NaN or infinite numbers, or allows additional properties, or refers to
+        parameters that are not in the function signature (as does ``devices``).
+    """
+
+    def function_wrap(func):
+        if inspect.isgeneratorfunction(func):
+
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                return (yield from func(*args, **kwargs))
+
+        else:
+
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                return func(*args, **kwargs)
+
+        if hasattr(request_model, "model_json_schema"):
+            request_schema = request_model.model_json_schema()
+        else:
+            request_schema = request_model
+
+        # The descriptor is saved to YAML files and sent over 0MQ, so it may contain only JSON values.
+        #   The conversion also creates a copy (the dictionaries passed to the decorator may be reused).
+        descriptor = {"id": id, "version": version, "request_schema": request_schema, "devices": devices or {}}
+        descriptor = json.loads(json.dumps(descriptor, allow_nan=False))
+
+        jsonschema.validate(instance=descriptor, schema=_operation_descriptor_schema)
+        jsonschema.Draft202012Validator.check_schema(descriptor["request_schema"])
+
+        name = f"Operation {id!r} version {version!r} (function '{func.__name__}')"
+        if descriptor["request_schema"].get("additionalProperties") is not False:
+            raise ValueError(f"{name}: the request schema must set 'additionalProperties' to False.")
+
+        parameters = inspect.signature(func).parameters
+        names = set(descriptor["request_schema"].get("properties", {})) | set(descriptor["devices"])
+        param_unknown = sorted(names - set(parameters))
+        if param_unknown:
+            raise ValueError(f"{name}: parameters {param_unknown} are not in the signature of the function.")
+
+        wrapper._operation_descriptor_ = descriptor
 
         return wrapper
 

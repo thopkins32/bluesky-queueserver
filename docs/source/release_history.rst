@@ -5,6 +5,15 @@ Release History
 Unreleased
 ==========
 
+Added
+-----
+
+- New ``operation`` decorator, which marks a plan as an operation in the catalog served to a controller
+  (such as ``bluesky-httpserver`` 2.x): operation ID and version, JSON Schema of the parameters and
+  the map of device IDs to device names. The operation descriptor is included in plan descriptions
+  returned by ``plans_existing`` and ``plans_allowed`` API. Generating the list of existing plans fails
+  if two plans define the same operation.
+
 Removed
 -------
 

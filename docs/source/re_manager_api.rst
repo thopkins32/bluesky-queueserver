@@ -406,7 +406,8 @@ Returns       **success**: *boolean*
 
               **plans_allowed**: *dict*
                   the dictionary that contains information on the allowed plans.
-                  Dictionary keys are plan names.
+                  Dictionary keys are plan names. Descriptions of plans that are operations
+                  include the ``operation`` key (see :ref:`operation_decorator`).
 
               **plans_allowed_uid**: *str* or *None*
                   UID of the list of allowed plans, *None* if the request fails.

@@ -2,9 +2,10 @@ import inspect
 import typing
 
 import jsonschema
+import pydantic
 import pytest
 
-from bluesky_queueserver.manager.annotation_decorator import parameter_annotation_decorator
+from bluesky_queueserver.manager.annotation_decorator import operation, parameter_annotation_decorator
 
 _simple_annotation = {
     "description": "Simple generator function",
@@ -533,3 +534,77 @@ def test_annotation_dectorator_10():
         yield from [1, 2, 3]
 
     assert inspect.isgeneratorfunction(func) is True
+
+
+class _CountRequest(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="forbid")
+    detectors: list[str]
+    num: int = pydantic.Field(1, ge=1)
+
+
+_count_request_schema = {
+    "type": "object",
+    "properties": {
+        "detectors": {"type": "array", "items": {"type": "string"}},
+        "num": {"type": "integer", "minimum": 1},
+    },
+    "required": ["detectors"],
+    "additionalProperties": False,
+}
+
+_count_devices = {"detectors": {"primary": "det1", "secondary": "det2"}}
+
+
+# fmt: off
+@pytest.mark.parametrize("request_model, request_schema", [
+    (_count_request_schema, _count_request_schema),
+    (_CountRequest, _CountRequest.model_json_schema()),
+])
+# fmt: on
+def test_operation_decorator_01(request_model, request_schema):
+    """
+    ``operation``: the descriptor is saved as a JSON-compatible copy and the plan is unchanged.
+    """
+
+    @operation(id="demo.count", version="1", request_model=request_model, devices=_count_devices)
+    def count_operation(detectors, num=1):
+        yield from [num]
+
+    assert count_operation._operation_descriptor_ == {
+        "id": "demo.count",
+        "version": "1",
+        "request_schema": request_schema,
+        "devices": _count_devices,
+    }
+    assert count_operation._operation_descriptor_["devices"] is not _count_devices
+    assert inspect.isgeneratorfunction(count_operation) is True
+    assert list(count_operation(["det1"], num=3)) == [3]
+
+
+# fmt: off
+@pytest.mark.parametrize("params, ex_type, err_msg", [
+    ({"request_model": {**_count_request_schema, "additionalProperties": True}}, ValueError,
+     "must set 'additionalProperties' to False"),
+    ({"request_model": {"type": "object", "properties": {"num": {}, "delay": {}}, "additionalProperties": False}},
+     ValueError, r"parameters \['delay'\] are not in the signature"),
+    ({"devices": {"motors": {"x": "motor1"}}}, ValueError, r"parameters \['motors'\] are not in the signature"),
+    ({"devices": {"detectors": {"primary": 1}}}, jsonschema.ValidationError, "1 is not of type 'string'"),
+    ({"id": ""}, jsonschema.ValidationError, "should be non-empty|is too short"),
+    ({"version": 1}, jsonschema.ValidationError, "1 is not of type 'string'"),
+    ({"request_model": {"type": "no-such-type", "additionalProperties": False}}, jsonschema.SchemaError,
+     "is not valid"),
+    ({"request_model": {"type": "object", "default": float("nan")}}, ValueError, "not JSON compliant"),
+])
+# fmt: on
+def test_operation_decorator_02_fail(params, ex_type, err_msg):
+    """
+    ``operation``: invalid descriptors are rejected when the plan is decorated.
+    """
+    defaults = {"id": "demo.count", "version": "1", "request_model": _count_request_schema}
+    params = {**defaults, "devices": _count_devices, **params}
+
+    with pytest.raises(ex_type, match=err_msg):
+
+        @operation(**params)
+        def count_operation(detectors, num=1):
+            yield from []

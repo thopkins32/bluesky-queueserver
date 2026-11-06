@@ -2814,7 +2814,8 @@ def _process_plan(plan, *, existing_devices, existing_plans):
                 <parameter_name_2>: ...
                 <parameter_name_3>: ...
                 ...
-            ]
+            ],
+            "operation": <descriptor defined by the 'operation' decorator>,  # only for operations
         }
 
     .. note::
@@ -3081,6 +3082,11 @@ def _process_plan(plan, *, existing_devices, existing_plans):
         # Properties
         ret["properties"]["is_generator"] = inspect.isgeneratorfunction(plan) or inspect.isgenerator(plan)
 
+        # Operation descriptor defined by the 'operation' decorator
+        operation = getattr(plan, "_operation_descriptor_", None)
+        if operation:
+            ret["operation"] = copy.deepcopy(operation)
+
         # Plan description
         desc = None
         if param_annotation:
@@ -3241,6 +3247,11 @@ def _prepare_plans(plans, *, existing_devices, ignore_invalid_plans=False):
     -------
     dict
         Dictionary that maps plan names to plan descriptions
+
+    Raises
+    ------
+    ValueError
+        Two plans define the same operation (the same operation ID and version).
     """
     reg_plans = reg_ns_items.reg_plans
 
@@ -3265,6 +3276,19 @@ def _prepare_plans(plans, *, existing_devices, ignore_invalid_plans=False):
                 logger.warning("PLAN WAS IGNORED: %s", ex)
             else:
                 raise
+
+    # Each operation must be defined by one plan. Duplicates fail even if invalid plans are ignored.
+    operation_plans = {}
+    for name in sorted(prepared_plans):
+        operation = prepared_plans[name].get("operation", None)
+        if operation:
+            key = (operation["id"], operation["version"])
+            if key in operation_plans:
+                raise ValueError(
+                    f"Plans '{operation_plans[key]}' and '{name}' define the same operation "
+                    f"{key[0]!r} version {key[1]!r}"
+                )
+            operation_plans[key] = name
 
     return prepared_plans
 

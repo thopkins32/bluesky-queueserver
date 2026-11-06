@@ -3624,6 +3624,63 @@ def test_zmq_api_plans_allowed_and_devices_allowed_3_fail(re_manager, params, me
     assert resp2["devices_allowed_uid"] is None
 
 
+_script_operation_count = """
+from bluesky_queueserver import operation
+
+@operation(
+    id="demo.count",
+    version="1",
+    request_model={
+        "type": "object",
+        "properties": {"detectors": {"type": "array", "items": {"type": "string"}}},
+        "required": ["detectors"],
+        "additionalProperties": False,
+    },
+    devices={"detectors": {"primary": "det1", "secondary": "det2"}},
+)
+def count_operation(detectors):
+    yield from count(detectors)
+"""
+
+
+def test_zmq_api_plans_allowed_and_devices_allowed_4(re_manager_pc_copy):  # noqa F811
+    """
+    'plans_allowed' and 'plans_existing' return descriptors of operations defined in RE Worker namespace.
+    """
+    _, pc_path = re_manager_pc_copy
+    append_code_to_last_startup_file(pc_path, additional_code=_script_operation_count)
+
+    plans_allowed_uid = get_manager_status()["plans_allowed_uid"]
+
+    resp1, _ = zmq_request("environment_open")
+    assert resp1["success"] is True
+    assert wait_for_condition(time=timeout_env_open, condition=condition_environment_created)
+
+    # The lists are downloaded from RE Worker after the environment is opened.
+    assert wait_for_condition(time=5, condition=lambda status: status["plans_allowed_uid"] != plans_allowed_uid)
+
+    expected = {
+        "id": "demo.count",
+        "version": "1",
+        "request_schema": {
+            "type": "object",
+            "properties": {"detectors": {"type": "array", "items": {"type": "string"}}},
+            "required": ["detectors"],
+            "additionalProperties": False,
+        },
+        "devices": {"detectors": {"primary": "det1", "secondary": "det2"}},
+    }
+    resp2, _ = zmq_request("plans_allowed", {"user_group": _user_group})
+    assert resp2["plans_allowed"]["count_operation"]["operation"] == expected
+    assert "operation" not in resp2["plans_allowed"]["count"]
+    resp3, _ = zmq_request("plans_existing")
+    assert resp3["plans_existing"]["count_operation"]["operation"] == expected
+
+    resp4, _ = zmq_request("environment_close")
+    assert resp4["success"] is True
+    assert wait_for_condition(time=5, condition=condition_environment_closed)
+
+
 # =======================================================================================
 #                      Method 'plans_existing', 'devices_existing'
 

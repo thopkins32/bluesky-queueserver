@@ -1020,6 +1020,43 @@ and this component is the last, the matching plan names are always added
 to the list and the regular expression is always applied to the full name).
 **Device type keywords can not be used in plan name patterns.**
 
+.. _operation_decorator:
+
+Operation Decorator
+-------------------
+
+The ``operation`` decorator (:ref:`plan_annotation_api`) marks a plan as an operation in the
+catalog served to a controller (such as ``bluesky-httpserver`` 2.x). The decorator defines
+the operation ID and version, the JSON Schema of the parameters clients may submit
+(a Pydantic model or a dictionary; the schema must set ``additionalProperties`` to ``False``)
+and the map from device IDs clients may pass to the names of devices in RE Worker namespace.
+The controller validates the parameters, replaces the device IDs with the device names and
+submits the plan with the parameters as keyword arguments. RE Worker validates the plan as
+any other plan, so the decorator may be combined with ``parameter_annotation_decorator``.
+
+.. code-block:: python
+
+    from bluesky.plans import count
+    from bluesky_queueserver import operation
+
+    @operation(
+        id="demo.count",
+        version="1",
+        request_model={
+            "type": "object",
+            "properties": {"detectors": {"type": "array", "items": {"type": "string"}}},
+            "required": ["detectors"],
+            "additionalProperties": False,
+        },
+        devices={"detectors": {"primary": "det1", "secondary": "det2"}},
+    )
+    def count_operation(detectors):
+        yield from count(detectors)
+
+The operation descriptor is included as ``operation`` in the plan description, which is saved
+in the list of existing plans and devices and returned by ``plans_existing`` and ``plans_allowed``
+API. Generation of the list fails if two plans define the operation with the same ID and version.
+
 .. _plan_annotation_api:
 
 Plan Annotation API
@@ -1030,3 +1067,4 @@ Plan Annotation API
     :toctree: generated
 
     parameter_annotation_decorator
+    operation

@@ -4,6 +4,7 @@ from ._version import __version__
 
 _LAZY_EXPORTS = {
     "parameter_annotation_decorator": (".manager.annotation_decorator", "parameter_annotation_decorator"),
+    "operation": (".manager.annotation_decorator", "operation"),
     "CommTimeoutError": (".manager.comms", "CommTimeoutError"),
     "ZMQCommSendAsync": (".manager.comms", "ZMQCommSendAsync"),
     "ZMQCommSendThreads": (".manager.comms", "ZMQCommSendThreads"),
