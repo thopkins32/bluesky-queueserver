@@ -636,22 +636,23 @@ class RunEngineManager(Process):
 
         return success, err_msg
 
-    async def _kill_re_worker(self):
+    async def _kill_re_worker(self, *, diagnostic=None):
         """
-        Kill the process in which RE worker is running.
+        Kill the process in which RE worker is running. ``diagnostic`` replaces the default
+        error message recorded in the history for the running plan.
         """
         if self._environment_exists or (self._manager_state == MState.CREATING_ENVIRONMENT):
             accepted, err_msg = True, ""
             # Cancel any operation of opening/closing the environment
             if self._fut_manager_task_completed and not self._fut_manager_task_completed.done():
                 self._fut_manager_task_completed.set_result(False)
-            asyncio.ensure_future(self._execute_background_task(self._kill_re_worker_task()))
+            asyncio.ensure_future(self._execute_background_task(self._kill_re_worker_task(diagnostic=diagnostic)))
         else:
             accepted = False
             err_msg = "RE environment does not exist"
         return accepted, err_msg
 
-    async def _kill_re_worker_task(self):
+    async def _kill_re_worker_task(self, *, diagnostic=None):
         """
         Stop RE Worker. Returns the result as "success", "rejected" or "failed"
         """
@@ -678,7 +679,7 @@ class RunEngineManager(Process):
             exit_status="failed",
             run_uids=[],
             scan_ids=[],
-            err_msg="RE Worker environment was destroyed",
+            err_msg=diagnostic or "RE Worker environment was destroyed",
             err_tb="",
         )
 
@@ -732,6 +733,8 @@ class RunEngineManager(Process):
         Periodically update locally stored RE Worker status
         """
         t_period = 0.5
+        # Check if the worker process is alive after this many consecutive 'request_state' timeouts.
+        n_timeouts_max, n_timeouts = 6, 0
         while True:
             await asyncio.sleep(t_period)
             if self._environment_exists or (self._manager_state == MState.CREATING_ENVIRONMENT):
@@ -740,6 +743,7 @@ class RunEngineManager(Process):
 
                 ws, _ = await self._worker_request_state()
                 if ws is not None:
+                    n_timeouts = 0
                     # Logic to minimize the number of unnecessary status updates
                     update_status = False
                     if self._worker_state_info != ws:
@@ -787,6 +791,14 @@ class RunEngineManager(Process):
 
                     if update_status:
                         self._status_update()
+                else:
+                    n_timeouts += 1
+                    if n_timeouts >= n_timeouts_max and await self._watchdog_is_worker_exited():
+                        # The process exited without closing the environment (e.g. it was killed by the OS).
+                        n_timeouts = 0
+                        diagnostic = "RE Worker process terminated unexpectedly"
+                        logger.error("%s. Destroying RE Worker environment ...", diagnostic)
+                        await self._kill_re_worker(diagnostic=diagnostic)
 
     async def _process_plan_report(self):
         """
@@ -1833,6 +1845,18 @@ class RunEngineManager(Process):
         except TimeoutError:
             worker_alive = False
         return worker_alive
+
+    async def _watchdog_is_worker_exited(self):
+        """
+        Check if RE Worker process exited. Unlike ``_watchdog_is_worker_alive``, returns False
+        if Watchdog does not respond, since the environment is destroyed if the process exited.
+        """
+        try:
+            response = await self._comm_to_watchdog.send_msg("is_worker_alive")
+            worker_exited = not response["worker_alive"]
+        except CommTimeoutError:
+            worker_exited = False
+        return worker_exited
 
     async def _watchdog_manager_stopping(self):
         """

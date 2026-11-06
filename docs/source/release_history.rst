@@ -14,6 +14,14 @@ Added
   returned by ``plans_existing`` and ``plans_allowed`` API. Generating the list of existing plans fails
   if two plans define the same operation.
 
+Fixed
+-----
+
+- RE Manager now detects that RE Worker process exited without closing the environment
+  (e.g. was killed by the OS) after 6 consecutive state requests time out. The environment is
+  destroyed, the running plan is recorded in the history as failed with the message
+  ``'RE Worker process terminated unexpectedly'`` and the manager returns to the idle state.
+
 Removed
 -------
 

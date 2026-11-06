@@ -5566,6 +5566,61 @@ def test_zmq_api_environment_destroy_03_fail(re_manager):  # noqa: F811
     assert "RE environment does not exist" in resp2["msg"]
 
 
+_script_plan_kill_worker = """
+import os
+import signal
+
+import bluesky.plan_stubs as bps
+
+def plan_kill_worker():
+    yield from bps.null()
+    os.kill(os.getpid(), signal.SIGKILL)
+    yield from bps.null()
+"""
+
+
+def test_zmq_api_environment_destroy_04_worker_killed(re_manager_pc_copy):  # noqa: F811
+    """
+    RE Worker process is killed while running a plan: RE Manager destroys the environment and records
+    the plan in the history with the diagnostic. A new environment can be opened.
+    """
+    _, pc_path = re_manager_pc_copy
+    append_code_to_last_startup_file(pc_path, additional_code=_script_plan_kill_worker)
+
+    plans_allowed_uid = get_manager_status()["plans_allowed_uid"]
+
+    resp1, _ = zmq_request("environment_open")
+    assert resp1["success"] is True
+    assert wait_for_condition(time=timeout_env_open, condition=condition_environment_created)
+
+    # Wait until the list of allowed plans, which includes the new plan, is downloaded from RE Worker.
+    assert wait_for_condition(time=5, condition=lambda status: status["plans_allowed_uid"] != plans_allowed_uid)
+
+    item = {"name": "plan_kill_worker", "item_type": "plan"}
+    resp2, _ = zmq_request("queue_item_execute", {"item": item, "user": _user, "user_group": _user_group})
+    assert resp2["success"] is True, pprint.pformat(resp2)
+
+    assert wait_for_condition(time=20, condition=condition_environment_closed)
+
+    resp3, _ = zmq_request("history_get")
+    (history_item,) = resp3["items"]
+    assert history_item["item_uid"] == resp2["item"]["item_uid"]
+    assert history_item["result"]["exit_status"] == "failed"
+    assert history_item["result"]["msg"] == "RE Worker process terminated unexpectedly"
+
+    status = get_manager_status()
+    assert status["running_item_uid"] is None
+    assert status["items_in_queue"] == 0  # An immediately executed plan is not pushed back to the queue
+
+    resp4, _ = zmq_request("environment_open")
+    assert resp4["success"] is True
+    assert wait_for_condition(time=timeout_env_open, condition=condition_environment_created)
+
+    resp5, _ = zmq_request("environment_close")
+    assert resp5["success"] is True
+    assert wait_for_condition(time=5, condition=condition_environment_closed)
+
+
 # ======================================================================================
 #                           Method 're_pause'
 
