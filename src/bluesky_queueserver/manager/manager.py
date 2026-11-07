@@ -58,29 +58,29 @@ class MState(enum.Enum):
     DESTROYING_ENVIRONMENT = "destroying_environment"
 
 
-# Requests rejected in controller-fronted mode: the controller owns the queue, and nobody may run
-#   arbitrary code, change permissions or lock RE Manager.
-_methods_disabled_in_controller_fronted_mode = frozenset(
+# The only requests accepted in controller-fronted mode. The controller owns the queue and runs plans
+#   with 'queue_item_execute'; every other request is rejected and changes nothing.
+_methods_enabled_in_controller_fronted_mode = frozenset(
     {
-        "queue_item_add",
-        "queue_item_add_batch",
-        "queue_item_update",
-        "queue_item_move",
-        "queue_item_move_batch",
-        "queue_item_remove",
-        "queue_item_remove_batch",
-        "queue_clear",
-        "queue_start",
-        "queue_stop",
-        "queue_autostart",
-        "queue_mode_set",
-        "script_upload",
-        "function_execute",
-        "permissions_set",
-        "permissions_reload",
-        "environment_update",
-        "lock",
-        "unlock",
+        "ping",
+        "status",
+        "config_get",
+        "plans_existing",
+        "plans_allowed",
+        "devices_existing",
+        "devices_allowed",
+        "queue_item_execute",
+        "history_get",
+        "history_clear",
+        "re_pause",
+        "re_resume",
+        "re_stop",
+        "re_abort",
+        "re_halt",
+        "re_runs",
+        "environment_open",
+        "environment_close",
+        "environment_destroy",
     }
 )
 
@@ -570,9 +570,17 @@ class RunEngineManager(Process):
                 self._re_pause_pending = False
                 logger.info("Worker started successfully.")
                 success, err_msg = True, ""
+            elif self._manager_state == MState.DESTROYING_ENVIRONMENT:
+                # The environment is destroyed by '_kill_re_worker_task', which also sets the state.
+                logger.error("RE Worker environment was destroyed while it was being opened.")
+                success, err_msg = False, "RE Worker environment was destroyed while it was being opened."
             else:
                 self._environment_exists = True
-                await self._confirm_re_worker_exit()
+                exit_confirmed, _ = await self._confirm_re_worker_exit()
+                if not exit_confirmed:
+                    # The process may still be running or may have exited (e.g. killed by the OS)
+                    #   without closing the environment. Kill (and join) the process in both cases.
+                    await self._watchdog_kill_re_worker()
                 self._environment_exists = False
                 self._worker_state_info = None
                 self._re_pause_pending = False
@@ -584,8 +592,9 @@ class RunEngineManager(Process):
             logger.exception("Failed to start_Worker: %s", ex)
             success, err_msg = False, f"Failed to start_Worker {str(ex)}"
 
-        self._manager_state = MState.IDLE
-        self._status_update()
+        if self._manager_state != MState.DESTROYING_ENVIRONMENT:
+            self._manager_state = MState.IDLE
+            self._status_update()
 
         if success:
             self._autostart_push()
@@ -632,7 +641,8 @@ class RunEngineManager(Process):
         """
         # Repeat the checks, since it is important for the manager to be in the correct state.
         if not self._environment_exists:
-            self._manager_state = MState.IDLE
+            if self._manager_state != MState.DESTROYING_ENVIRONMENT:
+                self._manager_state = MState.IDLE
             return False, "Environment does not exist"
 
         if self._manager_state not in [MState.IDLE, MState.CLOSING_ENVIRONMENT]:
@@ -641,7 +651,9 @@ class RunEngineManager(Process):
         self._fut_manager_task_completed = self._loop.create_future()
 
         success, err_msg = await self._worker_command_close_env()
-        if success:
+        if success and (self._manager_state == MState.DESTROYING_ENVIRONMENT):
+            success, err_msg = False, "RE Worker environment was destroyed while it was being closed"
+        elif success:
             # Wait for RE Worker to be prepared to close
             self._event_worker_closed = asyncio.Event()  # !!
 
@@ -651,7 +663,10 @@ class RunEngineManager(Process):
 
             await self._fut_manager_task_completed  # TODO: timeout may be needed here
 
-            if not await self._confirm_re_worker_exit():
+            if self._manager_state == MState.DESTROYING_ENVIRONMENT:
+                # The environment is destroyed by '_kill_re_worker_task', which also sets the state.
+                success, err_msg = False, "RE Worker environment was destroyed while it was being closed"
+            elif not await self._confirm_re_worker_exit():
                 success = False
                 err_msg = "Failed to confirm closing of RE Worker thread"
             else:
@@ -659,7 +674,8 @@ class RunEngineManager(Process):
         else:
             logger.error("Environment can not be closed: %s", err_msg)
 
-        self._manager_state = MState.IDLE
+        if self._manager_state != MState.DESTROYING_ENVIRONMENT:
+            self._manager_state = MState.IDLE
         self._running_task_uid = None
         self._status_update()
 
@@ -670,8 +686,14 @@ class RunEngineManager(Process):
         Kill the process in which RE worker is running. ``diagnostic`` replaces the default
         error message recorded in the history for the running plan.
         """
-        if self._environment_exists or (self._manager_state == MState.CREATING_ENVIRONMENT):
+        if self._manager_state == MState.DESTROYING_ENVIRONMENT:
+            accepted = False
+            err_msg = "RE Worker environment is already being destroyed"
+        elif self._environment_exists or (self._manager_state == MState.CREATING_ENVIRONMENT):
             accepted, err_msg = True, ""
+            # Set the state before completing the future: the tasks that open or close the environment
+            #   must see that the environment is being destroyed and leave the state to the kill task.
+            self._manager_state = MState.DESTROYING_ENVIRONMENT
             # Cancel any operation of opening/closing the environment
             if self._fut_manager_task_completed and not self._fut_manager_task_completed.done():
                 self._fut_manager_task_completed.set_result(False)
@@ -685,41 +707,37 @@ class RunEngineManager(Process):
         """
         Stop RE Worker. Returns the result as "success", "rejected" or "failed"
         """
-        success = False
-        self._manager_state = MState.DESTROYING_ENVIRONMENT
         self._status_update()
-        await self._watchdog_kill_re_worker()
-        # Wait for at most 10 seconds. Consider the environment destroyed after this.
-        #   This should never fail unless there is a bug in the Manager or Watchdog,
-        #   since killing process can be done in any state of the Worker.
-        # TODO: think about handling timeout errors.
-        for _ in range(10):
-            await asyncio.sleep(1)
-            if not await self._watchdog_is_worker_alive():
-                success = True
-                break
+        # Watchdog kills and joins the process. The state stays 'destroying_environment' until
+        #   the process is gone, so no other RE Worker can be started in the meantime.
+        success = await self._watchdog_kill_re_worker(timeout=10)
+
+        if success:
+            self._environment_exists = False
+            self._worker_state_info = None
+
+            # If a plan is running, it needs to be pushed back into the queue
+            await self._plan_queue.set_processed_item_as_stopped(
+                exit_status="failed",
+                run_uids=[],
+                scan_ids=[],
+                err_msg=diagnostic or "RE Worker environment was destroyed",
+                err_tb="",
+            )
+            await self._task_results.clear_running_tasks()
+            self._running_task_uid = None
+            err_msg = ""
+            logger.info("RE Worker environment is destroyed")
+        else:
+            # The process may still be running: report the environment as existing, so that
+            #   no other RE Worker is started next to it. Destroying the environment may be retried.
+            self._environment_exists = True
+            err_msg = (
+                "Failed to destroy RE Worker environment: Watchdog did not confirm that the process was killed"
+            )
+            logger.error(err_msg)
 
         self._manager_state = MState.IDLE
-        self._environment_exists = False
-        self._worker_state_info = None
-
-        # If a plan is running, it needs to be pushed back into the queue
-        await self._plan_queue.set_processed_item_as_stopped(
-            exit_status="failed",
-            run_uids=[],
-            scan_ids=[],
-            err_msg=diagnostic or "RE Worker environment was destroyed",
-            err_tb="",
-        )
-
-        err_msg = "" if success else "Failed to properly destroy RE Worker environment."
-        logger.info("RE Worker environment is destroyed")
-        if not success:
-            logger.error(err_msg)
-        else:
-            await self._task_results.clear_running_tasks()
-
-        self._running_task_uid = None
         self._status_update()
 
         return success, err_msg
@@ -826,8 +844,15 @@ class RunEngineManager(Process):
                         # The process exited without closing the environment (e.g. it was killed by the OS).
                         n_timeouts = 0
                         diagnostic = "RE Worker process terminated unexpectedly"
-                        logger.error("%s. Destroying RE Worker environment ...", diagnostic)
-                        await self._kill_re_worker(diagnostic=diagnostic)
+                        if self._manager_state == MState.CREATING_ENVIRONMENT:
+                            # '_start_re_worker_task' cleans up after the environment that failed to open
+                            logger.error("%s while the environment was being opened", diagnostic)
+                            fut = self._fut_manager_task_completed
+                            if fut and not fut.done():
+                                fut.set_result(False)
+                        else:
+                            logger.error("%s. Destroying RE Worker environment ...", diagnostic)
+                            await self._kill_re_worker(diagnostic=diagnostic)
 
     async def _process_plan_report(self):
         """
@@ -1853,12 +1878,14 @@ class RunEngineManager(Process):
             success = False
         return success
 
-    async def _watchdog_kill_re_worker(self):
+    async def _watchdog_kill_re_worker(self, timeout=None):
         """
         Request Watchdog to kill RE Worker process (justified only if the process is not responsive).
+        Watchdog kills and joins the process. ``timeout`` is the time to wait for the response
+        (default timeout of the communication channel is used if ``None``).
         """
         try:
-            response = await self._comm_to_watchdog.send_msg("kill_re_worker")
+            response = await self._comm_to_watchdog.send_msg("kill_re_worker", timeout=timeout)
             success = response["success"]
         except CommTimeoutError:
             success = False
@@ -3808,7 +3835,7 @@ class RunEngineManager(Process):
 
             handler_name = handler_dict[method]
             handler = getattr(self, handler_name)
-            if self._controller_fronted and (method in _methods_disabled_in_controller_fronted_mode):
+            if self._controller_fronted and (method not in _methods_enabled_in_controller_fronted_mode):
                 result = {"success": False, "msg": "disabled in controller-fronted mode"}
             else:
                 result = await handler(params)
@@ -4050,6 +4077,7 @@ class RunEngineManager(Process):
                     #   explicit permission. This option should not be available to
                     #   regular users.
                     # TODO: may be additional level of protection should be added here.
+                    self._manager_state = MState.DESTROYING_ENVIRONMENT
                     await self._kill_re_worker_task()
 
                 await self._watchdog_manager_stopping()

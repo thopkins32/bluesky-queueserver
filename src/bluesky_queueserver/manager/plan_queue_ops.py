@@ -261,8 +261,8 @@ class PlanQueueOperations:
             self._lock = asyncio.Lock()
             async with self._lock:
                 try:
-                    if "://" not in self._redis_host:
-                        host = f"redis://{self._redis_host}"
+                    # Addresses with a scheme ('redis://', 'rediss://', 'unix://') are passed unchanged
+                    host = self._redis_host if "://" in self._redis_host else f"redis://{self._redis_host}"
                     logger.debug("Connecting to Redis host at'%s'", host)
                     self._r_pool = redis.asyncio.from_url(host, encoding="utf-8", decode_responses=True)
                     await self._r_pool.ping()

@@ -327,14 +327,21 @@ Other Configuration Parameters
     --controller-fronted {ON,OFF}
                       Enable (ON) or disable (OFF) controller-fronted mode, in which a
                       controller (such as bluesky-httpserver 2.x) owns the queue and is the
-                      only client of RE Manager. In this mode RE Manager refuses to start
-                      unless the control and info addresses are 'ipc://' paths and rejects
-                      the requests that edit or start the queue, upload scripts, execute
-                      functions, change permissions, update the environment or lock RE
-                      Manager (default: OFF).
+                      only client of RE Manager. In this mode RE Manager refuses to start if
+                      IPython kernel is used or if the control and info addresses are not
+                      'ipc://' addresses with absolute paths (such as
+                      'ipc:///run/qserver/control'), and accepts only the requests used by
+                      the controller: 'ping', 'status', 'config_get', 'plans_existing',
+                      'plans_allowed', 'devices_existing', 'devices_allowed',
+                      'queue_item_execute', 'history_get', 'history_clear', 're_pause',
+                      're_resume', 're_stop', 're_abort', 're_halt', 're_runs',
+                      'environment_open', 'environment_close' and 'environment_destroy'
+                      (default: OFF).
     --redis-addr REDIS_ADDR
                       The address of Redis server, e.g. 'localhost', '127.0.0.1',
-                      'localhost:6379', 'localhost:6379/0'.(default: localhost).
+                      'localhost:6379', 'localhost:6379/0', or a URL, e.g.
+                      'redis://:password@localhost:6379/0' or
+                      'unix:///run/redis/redis.sock' (default: localhost).
     --redis-name-prefix REDIS_NAME_PREFIX
                       The prefix for the names of Redis keys used by RE Manager (default:
                       qs_default).

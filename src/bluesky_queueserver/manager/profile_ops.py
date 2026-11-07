@@ -1042,8 +1042,13 @@ def prepare_plan(plan, *, plans_in_nspace, devices_in_nspace, allowed_plans, all
 
     for p_name in default_params:
         value = default_params[p_name]
-        # Fetch parameter description ({} if parameter is not found)
-        pp = group_plans[plan_name].get(p_name, {})
+        if "operation" in group_plans[plan_name]:
+            # Operations: process the default as a value of the parameter (only names in the device map
+            #   are converted to devices).
+            pp = param_descriptions.get(p_name, {})
+        else:
+            # Fetch parameter description ({} if parameter is not found)
+            pp = group_plans[plan_name].get(p_name, {})
         default_params[p_name] = process_parameter_value(
             value, pp, items_in_nspace, group_plans, group_devices, nspace
         )
@@ -2756,6 +2761,32 @@ def _parse_docstring(docstring):
     return doc_annotation
 
 
+def _operation_device_annotation(operation, parameter_name, *, existing_plans, existing_devices):
+    """
+    Returns the annotation of a parameter in the device map of an operation (the descriptor
+    defined by the ``operation`` decorator). The annotation lists exactly the device names
+    in the map as the devices accepted by the parameter, so RE Worker converts those names
+    and rejects any other value. The parameter accepts one name if the request schema defines
+    the parameter as a string, a list of names if it defines an array, and either otherwise.
+    The annotation replaces any annotation of the parameter in the plan header or in
+    ``parameter_annotation_decorator``.
+    """
+    type_name = "Devices"
+    schema_type = operation["request_schema"].get("properties", {}).get(parameter_name, {}).get("type", None)
+    if schema_type == "string":
+        annotation_type = type_name
+    elif schema_type == "array":
+        annotation_type = f"typing.List[{type_name}]"
+    else:
+        annotation_type = f"typing.Union[{type_name}, typing.List[{type_name}]]"
+
+    device_names = sorted(set(operation["devices"][parameter_name].values()))
+    annotation = {"type": annotation_type, "devices": {type_name: device_names}}
+    return _expand_parameter_annotation(
+        annotation, existing_devices=existing_devices, existing_plans=existing_plans
+    )
+
+
 def _process_plan(plan, *, existing_devices, existing_plans):
     """
     Returns parameters of a plan. The function accepts callable object that implements the plan
@@ -2765,6 +2796,11 @@ def _process_plan(plan, *, existing_devices, existing_plans):
     then the specifications of plan and parameter descriptions and parameter annotations passed
     to the decorator override the descriptions from the docstring and Python parameter annotations
     from the function header.
+
+    If the plan is decorated with ``operation``, then each parameter in the device map of the operation
+    is annotated with the list of device names from the map (see ``_operation_device_annotation()``),
+    which overrides other annotations of the parameter, and conversion of plan names, device names
+    (except the names in the map) and expressions is disabled for all parameters.
 
     Limitation on the support types of the plan parameters and the default values that could be
     used in function signatures. Parameter types must be native Python types (such as ``int``,
@@ -3163,6 +3199,11 @@ def _process_plan(plan, *, existing_devices, existing_plans):
                 if annotation:
                     # The case when annotation does exist (otherwise it is None)
                     annotation = {"type": annotation}
+            if operation and (p.name in operation["devices"]):
+                # The devices of the parameter are exactly the values of the device map
+                annotation = _operation_device_annotation(
+                    operation, p.name, existing_plans=existing_plans, existing_devices=existing_devices
+                )
             if default and p.default is inspect.Parameter.empty:
                 # The default value in the decorator overrides the default value in the header,
                 #   not replace it. Therefore the default value is required in the header if
@@ -3194,6 +3235,16 @@ def _process_plan(plan, *, existing_devices, existing_plans):
                     working_dict["convert_device_names"] = True
                 if convert_values["eval_expressions"] and ("eval_expressions" not in working_dict):
                     working_dict["eval_expressions"] = True
+
+            if operation:
+                # Strings passed to an operation are converted only to the devices listed in the device
+                #   map (by the annotation set above). Plan names and expressions are never converted.
+                working_dict["convert_plan_names"] = False
+                working_dict.pop("eval_expressions", None)
+                if p.name in operation["devices"]:
+                    working_dict.pop("convert_device_names", None)
+                else:
+                    working_dict["convert_device_names"] = False
 
             if default:
                 # Verify that the encoded representation of the default can be decoded.

@@ -589,6 +589,10 @@ def test_operation_decorator_01(request_model, request_schema):
      ValueError, r"parameters \['delay'\] are not in the signature"),
     ({"devices": {"motors": {"x": "motor1"}}}, ValueError, r"parameters \['motors'\] are not in the signature"),
     ({"devices": {"detectors": {"primary": 1}}}, jsonschema.ValidationError, "1 is not of type 'string'"),
+    # Values of the device map are device names, not name patterns
+    ({"devices": {"detectors": {"primary": ":^det"}}}, jsonschema.ValidationError, "does not match"),
+    ({"devices": {"detectors": {"primary": "__READABLE__:^det"}}}, jsonschema.ValidationError, "does not match"),
+    ({"devices": {"detectors": {"primary": "det1."}}}, jsonschema.ValidationError, "does not match"),
     ({"id": ""}, jsonschema.ValidationError, "should be non-empty|is too short"),
     ({"version": 1}, jsonschema.ValidationError, "1 is not of type 'string'"),
     ({"request_model": {"type": "no-such-type", "additionalProperties": False}}, jsonschema.SchemaError,

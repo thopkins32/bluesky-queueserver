@@ -1029,10 +1029,22 @@ The ``operation`` decorator (:ref:`plan_annotation_api`) marks a plan as an oper
 catalog served to a controller (such as ``bluesky-httpserver`` 2.x). The decorator defines
 the operation ID and version, the JSON Schema of the parameters clients may submit
 (a Pydantic model or a dictionary; the schema must set ``additionalProperties`` to ``False``)
-and the map from device IDs clients may pass to the names of devices in RE Worker namespace.
-The controller validates the parameters, replaces the device IDs with the device names and
-submits the plan with the parameters as keyword arguments. RE Worker validates the plan as
-any other plan, so the decorator may be combined with ``parameter_annotation_decorator``.
+and the map from device IDs clients may pass to the names of devices in RE Worker namespace
+(the names must be device or subdevice names, such as ``det1`` or ``stage.det.val``, not
+name patterns). The controller validates the parameters, replaces the device IDs with the device
+names and submits the plan with the parameters as keyword arguments.
+
+RE Worker converts strings passed to an operation to devices only in the parameters in the device
+map, and only the names listed in the map for the parameter: each such parameter is annotated with
+the custom type ``Devices`` that lists the names (``Devices`` if the request schema defines the parameter
+as a string, ``typing.List[Devices]`` if it defines an array, either one otherwise), so the plan
+receives the devices whatever the type hint of the parameter is, and any other value is rejected.
+Strings passed in any other parameter, including names of plans and devices and expressions, are
+passed to the plan unchanged (conversion of plan and device names and evaluation of expressions
+are disabled). The decorator may be combined with ``parameter_annotation_decorator``: the annotation
+of a parameter in the device map is replaced as described above (its description, default value
+and other items are kept), and the annotations of other parameters are used to validate the values,
+but the strings are not converted to plans or devices.
 
 .. code-block:: python
 

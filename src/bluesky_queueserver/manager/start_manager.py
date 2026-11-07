@@ -452,9 +452,12 @@ def start_manager():
         default="OFF",
         help="Enable (ON) or disable (OFF) controller-fronted mode, in which a controller (such as "
         "bluesky-httpserver 2.x) owns the queue and is the only client of RE Manager. In this mode RE Manager "
-        "refuses to start unless the control and info addresses are 'ipc://' paths and rejects the requests "
-        "that edit or start the queue, upload scripts, execute functions, change permissions, update "
-        "the environment or lock RE Manager (default: %(default)s).",
+        "refuses to start if IPython kernel is used or if the control and info addresses are not 'ipc://' "
+        "addresses with absolute paths (such as 'ipc:///run/qserver/control'), and accepts only the requests "
+        "used by the controller: 'ping', 'status', 'config_get', 'plans_existing', 'plans_allowed', "
+        "'devices_existing', 'devices_allowed', 'queue_item_execute', 'history_get', 'history_clear', "
+        "'re_pause', 're_resume', 're_stop', 're_abort', 're_halt', 're_runs', 'environment_open', "
+        "'environment_close' and 'environment_destroy' (default: %(default)s).",
     )
 
     parser.add_argument(
@@ -462,7 +465,8 @@ def start_manager():
         dest="redis_addr",
         type=str,
         default="localhost",
-        help="The address of Redis server, e.g. 'localhost', '127.0.0.1', 'localhost:6379', 'localhost:6379/0'."
+        help="The address of Redis server, e.g. 'localhost', '127.0.0.1', 'localhost:6379', 'localhost:6379/0', "
+        "or a URL, e.g. 'redis://:password@localhost:6379/0' or 'unix:///run/redis/redis.sock' "
         "(default: %(default)s). ",
     )
 
@@ -698,12 +702,21 @@ def start_manager():
     settings = Settings(parser=parser, args=args)
 
     # Check before any socket is bound: in controller-fronted mode only the processes that can access
-    #   the 'ipc://' paths may connect to RE Manager.
+    #   the socket files may connect to RE Manager, and nobody may run code in the worker namespace.
     if settings.controller_fronted:
+        if settings.use_ipython_kernel:
+            logger.error("Controller-fronted mode can not be used with IPython kernel")
+            return 1
         for name in ("zmq_control_addr", "zmq_info_addr"):
             address = getattr(settings, name)
-            if not address.startswith("ipc://"):
-                logger.error("Controller-fronted mode requires an 'ipc://' address: %s=%r", name, address)
+            # 'ipc://@name' is an abstract socket (Linux), which has no file permissions.
+            if not (address.startswith("ipc://") and os.path.isabs(address[len("ipc://") :])):
+                logger.error(
+                    "Controller-fronted mode requires an 'ipc://' address with an absolute path "
+                    "(e.g. 'ipc:///run/qserver/control'): %s=%r",
+                    name,
+                    address,
+                )
                 return 1
 
     msg_queue = Queue()

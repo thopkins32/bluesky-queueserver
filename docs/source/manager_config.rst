@@ -209,8 +209,9 @@ Parameters that define for network settings used by RE Manager:
   ``--zmq-publish-console`` CLI parameter.
 
 - ``redis_addr`` - the address of Redis server, e.g. ``localhost``, ``127.0.0.1``, ``localhost:6379``.
-  The address may also contain a Redis database number, e.g. ``localhost:6379/0``.
-  Redis address may also be passed using ``--redis-addr`` CLI parameter.
+  The address may also contain a Redis database number, e.g. ``localhost:6379/0``, or be a URL
+  supported by ``redis.from_url()``, e.g. ``redis://:password@localhost:6379/0`` or
+  ``unix:///run/redis/redis.sock``. Redis address may also be passed using ``--redis-addr`` CLI parameter.
 
 - ``redis_name_prefix`` - the prefix is appended to the Redis keys to differentiate between keys
   created by different instances of RE Manager. The value may also be passed using
@@ -271,14 +272,17 @@ The parameters that define run-time behavior of RE Manager:
 - ``controller_fronted`` - enables (``true``) or disables (``false``, default) controller-fronted
   mode, in which a controller (such as ``bluesky-httpserver`` 2.x) owns the queue and is the only
   client of RE Manager. In this mode RE Manager refuses to start unless ``zmq_control_addr`` and
-  ``zmq_info_addr`` are ``ipc://`` paths, so only the processes that can access the paths may
-  connect. The requests ``queue_item_add``, ``queue_item_add_batch``, ``queue_item_update``,
-  ``queue_item_move``, ``queue_item_move_batch``, ``queue_item_remove``, ``queue_item_remove_batch``,
-  ``queue_clear``, ``queue_start``, ``queue_stop``, ``queue_autostart``, ``queue_mode_set``,
-  ``script_upload``, ``function_execute``, ``permissions_set``, ``permissions_reload``,
-  ``environment_update``, ``lock`` and ``unlock`` are rejected with the message
-  ``'disabled in controller-fronted mode'`` and change nothing. The controller runs plans using
-  ``queue_item_execute``. The value may also be set using ``--controller-fronted`` CLI parameter.
+  ``zmq_info_addr`` are ``ipc://`` addresses with absolute paths (e.g. ``ipc:///run/qserver/control``),
+  so only the processes that can access the socket files may connect. Abstract sockets
+  (``ipc://@name``) and relative paths are rejected. RE Manager also refuses to start if IPython kernel
+  is used (``use_ipython_kernel``), since clients of the kernel could run any code in RE Worker namespace.
+  Only the requests used by the controller are accepted: ``ping``, ``status``, ``config_get``,
+  ``plans_existing``, ``plans_allowed``, ``devices_existing``, ``devices_allowed``,
+  ``queue_item_execute``, ``history_get``, ``history_clear``, ``re_pause``, ``re_resume``, ``re_stop``,
+  ``re_abort``, ``re_halt``, ``re_runs``, ``environment_open``, ``environment_close`` and
+  ``environment_destroy``. All other requests (including ``manager_stop``) are rejected with
+  the message ``'disabled in controller-fronted mode'`` and change nothing. The controller runs plans
+  using ``queue_item_execute``. The value may also be set using ``--controller-fronted`` CLI parameter.
 
 .. _config_file_worker:
 

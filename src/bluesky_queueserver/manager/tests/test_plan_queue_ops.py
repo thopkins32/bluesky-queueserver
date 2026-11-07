@@ -70,6 +70,41 @@ def test_pq_start_stop():
 
 
 # fmt: off
+@pytest.mark.parametrize("redis_host", [
+    "localhost", "localhost:6379", "redis://localhost", "redis://localhost:6379", "redis://127.0.0.1:6379/0",
+])
+# fmt: on
+def test_pq_start_redis_host_1(redis_host):
+    """
+    ``PlanQueueOperations.start()``: Redis address may be a host name (with optional port and database)
+    or a URL (e.g. ``redis://localhost:6379/0``).
+    """
+
+    async def testing():
+        pq = PlanQueueOperations(redis_host=redis_host, name_prefix=_test_redis_name_prefix)
+        await pq.start()
+        await pq._r_pool.ping()
+        await pq.stop()
+
+    asyncio.run(testing())
+
+
+def test_pq_start_redis_host_2_fail(tmp_path):
+    """
+    ``PlanQueueOperations.start()``: the URL is passed to Redis client (connecting to a unix socket
+    that does not exist fails because the socket does not exist).
+    """
+
+    async def testing():
+        pq = PlanQueueOperations(redis_host=f"unix://{tmp_path}/redis.sock", name_prefix=_test_redis_name_prefix)
+        with pytest.raises(OSError, match="Failed to create the Redis pool") as ex_info:
+            await pq.start()
+        assert "No such file or directory" in str(ex_info.value), str(ex_info.value)
+
+    asyncio.run(testing())
+
+
+# fmt: off
 @pytest.mark.parametrize("item_in, item_out", [
     ({"name": "plan1", "item_uid": "abcde"}, {"name": "plan1", "item_uid": "abcde"}),
     ({"user": "user1", "user_group": "group1"}, {"user": "user1", "user_group": "group1"}),

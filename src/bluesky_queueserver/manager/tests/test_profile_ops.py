@@ -5276,6 +5276,112 @@ def test_prepare_plan_5(plan, from_nspace):
             assert obj != eval(v, ns_other, ns_other)
 
 
+_script_test_plan_operations = """
+import typing
+from bluesky_queueserver import operation, parameter_annotation_decorator
+
+_op_schema = {
+    "type": "object",
+    "properties": {
+        "detectors": {"type": "array", "items": {"type": "string"}},
+        "motor": {"type": "string"},
+        "sample": {"type": "string"},
+        "md": {"type": "object"},
+    },
+    "additionalProperties": False,
+}
+_op_devices = {"detectors": {"primary": "det1", "secondary": "det2"}, "motor": {"x": "motor1"}}
+
+@operation(id="test.hints", version="1", request_model=_op_schema, devices=_op_devices)
+def op_hints(detectors: list, motor: typing.Any = None, sample=None, md=None, func=None):
+    yield from []
+
+_op_annotation = {
+    "parameters": {
+        "detectors": {"annotation": "typing.List[Dets]", "devices": {"Dets": ["det1", "det2", "det4"]}},
+        "motor": {"annotation": "__MOVABLE__"},
+        "sample": {"annotation": "Motors", "devices": {"Motors": ["motor2"]}, "default": "motor2"},
+        "md": {"annotation": "typing.Dict[str, typing.Any]"},
+        "func": {"annotation": "__CALLABLE__"},
+    }
+}
+
+@operation(id="test.annotated", version="1", request_model=_op_schema, devices=_op_devices)
+@parameter_annotation_decorator(_op_annotation)
+def op_annotated(detectors, motor=None, sample=None, md=None, func=None):
+    yield from []
+
+@parameter_annotation_decorator(_op_annotation)
+@operation(id="test.annotated_inner", version="1", request_model=_op_schema, devices=_op_devices)
+def op_annotated_inner(detectors, motor=None, sample=None, md=None, func=None):
+    yield from []
+"""
+
+
+def _gen_environment_operations():
+    pc_path = get_default_startup_dir()
+    nspace = load_profile_collection(pc_path)
+    exec(_script_test_plan_operations, nspace, nspace)
+    existing_plans, existing_devices, plans, devices = existing_plans_and_devices_from_nspace(nspace=nspace)
+    allowed_plans, allowed_devices = load_allowed_plans_and_devices(
+        path_existing_plans_and_devices=None,
+        path_user_group_permissions=os.path.join(pc_path, "user_group_permissions.yaml"),
+        existing_plans=existing_plans,
+        existing_devices=existing_devices,
+    )
+    env = dict(plans_in_nspace=plans, devices_in_nspace=devices)
+    env.update(allowed_plans=allowed_plans, allowed_devices=allowed_devices)
+    return env, nspace
+
+
+# fmt: off
+@pytest.mark.parametrize("plan_name", ["op_hints", "op_annotated", "op_annotated_inner"])
+# fmt: on
+def test_prepare_plan_6_operation(plan_name):
+    """
+    ``prepare_plan``: for a plan decorated with ``operation``, only the names in the device map of
+    a parameter are converted to devices (regardless of the type hint or ``parameter_annotation_decorator``).
+    Other strings, including names of devices and plans and the default defined in the decorator,
+    are passed to the plan unchanged.
+    """
+    env, nspace = _gen_environment_operations()
+    md = {"note": "motor2.velocity", "x": ["det2", "count"], "f": "count"}
+    kwargs = {"detectors": ["det1", "det2"], "motor": "motor1", "md": copy.deepcopy(md), "func": "count"}
+    plan = {"name": plan_name, "user_group": _user_group, "kwargs": kwargs}
+
+    plan_parsed = prepare_plan(plan, nspace=nspace, **env)
+    bound = inspect.signature(nspace[plan_name]).bind(*plan_parsed["args"], **plan_parsed["kwargs"]).arguments
+    assert bound["detectors"] == [nspace["det1"], nspace["det2"]]
+    assert bound["motor"] is nspace["motor1"]
+    assert bound["md"] == md
+    assert bound["func"] == "count"
+    if plan_name == "op_hints":
+        assert "sample" not in bound
+    else:
+        assert plan_parsed["kwargs"]["sample"] == "motor2"  # Default defined in the decorator
+
+    plan["kwargs"] = {"detectors": ["det1"], "sample": "motor2"}
+    plan_parsed = prepare_plan(plan, nspace=nspace, **env)
+    bound = inspect.signature(nspace[plan_name]).bind(*plan_parsed["args"], **plan_parsed["kwargs"]).arguments
+    assert bound["sample"] == "motor2"
+
+    # Names outside the device map are rejected
+    for kwargs in ({"detectors": ["det1", "det4"]}, {"detectors": ["det1"], "motor": "motor2"}):
+        plan["kwargs"] = kwargs
+        with pytest.raises(RuntimeError, match="Validation of plan parameters failed"):
+            prepare_plan(plan, nspace=nspace, **env)
+
+    # Description of a parameter in the device map
+    params = {_["name"]: _ for _ in env["allowed_plans"][_user_group][plan_name]["parameters"]}
+    devices = {"Devices": ["det1", "det2"]}
+    assert params["detectors"]["annotation"] == {"type": "typing.List[Devices]", "devices": devices}
+    assert params["motor"]["annotation"] == {"type": "Devices", "devices": {"Devices": ["motor1"]}}
+    for name in ("sample", "md", "func"):
+        assert params[name]["convert_plan_names"] is False
+        assert params[name]["convert_device_names"] is False
+        assert "eval_expressions" not in params[name]
+
+
 # fmt: off
 _det_components = {
     "components": {

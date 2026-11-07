@@ -73,7 +73,14 @@ _operation_descriptor_schema = {
         "request_schema": {"type": "object"},
         "devices": {
             "type": "object",
-            "additionalProperties": {"type": "object", "additionalProperties": {"type": "string"}},
+            "additionalProperties": {
+                "type": "object",
+                # Names of devices or subdevices (e.g. 'det1' or 'stage.det.val'), not name patterns
+                "additionalProperties": {
+                    "type": "string",
+                    "pattern": "^[_a-zA-Z][_a-zA-Z0-9]*(\\.[_a-zA-Z][_a-zA-Z0-9]*)*$",
+                },
+            },
         },
     },
     "required": ["id", "version", "request_schema", "devices"],
@@ -335,7 +342,11 @@ def operation(*, id, version, request_model, devices=None):
     ``version`` and pass parameters, which the controller validates against ``request_model``.
     The controller then executes the plan with the parameters as keyword arguments, replacing
     the device ids listed in ``devices`` with the names of the devices in RE Worker namespace.
-    RE Worker validates the plan as any other plan.
+    RE Worker converts the strings passed to the plan to devices only in the parameters listed in
+    ``devices``, and only the device names listed for the parameter (other values are rejected).
+    Strings passed in other parameters, including names of plans and devices, are passed to the plan
+    unchanged. The annotation of a parameter listed in ``devices`` replaces the type hint and
+    the annotation defined by ``parameter_annotation_decorator`` for the parameter.
 
     The operation descriptor is saved as ``_operation_descriptor_`` attribute of the function. It is
     included as ``operation`` in the plan description, which is saved to the list of existing plans
@@ -369,7 +380,8 @@ def operation(*, id, version, request_model, devices=None):
         ``additionalProperties`` to ``False``. Each property must be a parameter of the function.
     devices: dict or None
         Maps names of the function parameters to dictionaries, which map the device ids clients
-        may pass to the names of the devices in RE Worker namespace.
+        may pass to the names of the devices (or subdevices, e.g. ``stage.det.val``) in RE Worker
+        namespace. The names may not be patterns.
 
     Raises
     ------

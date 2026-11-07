@@ -12,13 +12,16 @@ Added
   (such as ``bluesky-httpserver`` 2.x): operation ID and version, JSON Schema of the parameters and
   the map of device IDs to device names. The operation descriptor is included in plan descriptions
   returned by ``plans_existing`` and ``plans_allowed`` API. Generating the list of existing plans fails
-  if two plans define the same operation.
+  if two plans define the same operation. RE Worker converts strings passed to an operation to
+  devices only in the parameters in the device map, and only the device names listed in the map
+  (other names are rejected). Plan names, other device names and expressions are passed to
+  the plan as strings.
 
 - New ``controller_fronted`` configuration parameter (``--controller-fronted`` CLI parameter). In
-  controller-fronted mode RE Manager refuses to start unless the control and info addresses are
-  ``ipc://`` paths and rejects the requests that edit or start the queue, upload scripts, execute
-  functions, change permissions, update the environment or lock RE Manager. RE Manager status
-  includes the new ``controller_fronted`` field.
+  controller-fronted mode RE Manager refuses to start if IPython kernel is used or unless the control
+  and info addresses are ``ipc://`` addresses with absolute paths, and accepts only the requests used
+  by the controller (all other requests are rejected and change nothing). RE Manager status includes
+  the new ``controller_fronted`` field.
 
 Fixed
 -----
@@ -27,6 +30,19 @@ Fixed
   (e.g. was killed by the OS) after 6 consecutive state requests time out. The environment is
   destroyed, the running plan is recorded in the history as failed with the message
   ``'RE Worker process terminated unexpectedly'`` and the manager returns to the idle state.
+  If the process exits while the environment is being opened, opening fails and the manager
+  returns to the idle state after the process is cleaned up.
+
+- Destroying RE Worker environment could report a newer environment as closed and record its running
+  plan as failed: after the process was killed, the manager polled the process for up to 10 seconds
+  while the environment could already be opened again. The manager now stays in
+  the ``destroying_environment`` state until Watchdog confirms that the process was killed (if Watchdog
+  does not confirm it, the environment is still reported as existing). Opening or closing
+  the environment no longer changes the ``destroying_environment`` state, and a repeated
+  ``environment_destroy`` request is rejected while the environment is being destroyed.
+
+- Redis addresses that contain a scheme, such as ``redis://:password@localhost:6379/0`` or
+  ``unix:///run/redis/redis.sock``, failed with ``UnboundLocalError``.
 
 Removed
 -------

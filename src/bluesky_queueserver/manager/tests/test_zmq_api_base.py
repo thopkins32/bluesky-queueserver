@@ -5621,6 +5621,67 @@ def test_zmq_api_environment_destroy_04_worker_killed(re_manager_pc_copy):  # no
     assert wait_for_condition(time=5, condition=condition_environment_closed)
 
 
+_script_kill_worker_on_first_startup = """
+import os
+import signal
+
+import bluesky.plan_stubs as bps
+
+if not os.path.exists({marker!r}):
+    open({marker!r}, "w").close()
+    os.kill(os.getpid(), signal.SIGKILL)
+
+def plan_sleep(delay):
+    yield from bps.sleep(delay)
+"""
+
+
+def test_zmq_api_environment_destroy_05_worker_killed_while_opening(re_manager_pc_copy, tmp_path):  # noqa: F811
+    """
+    RE Worker process is killed while the environment is being opened. RE Manager reports the idle
+    state without the environment only after the process is cleaned up. The environment opened next
+    stays open and the plan started in it completes (the cleanup does not affect the new worker).
+    """
+    _, pc_path = re_manager_pc_copy
+    code = _script_kill_worker_on_first_startup.format(marker=str(tmp_path / "worker_killed"))
+    append_code_to_last_startup_file(pc_path, additional_code=code)
+
+    plans_allowed_uid = get_manager_status()["plans_allowed_uid"]
+
+    resp1, _ = zmq_request("environment_open")
+    assert resp1["success"] is True
+    assert wait_for_condition(time=3, condition=lambda status: status["manager_state"] == "creating_environment")
+    assert wait_for_condition(
+        time=20,
+        condition=lambda status: status["manager_state"] == "idle" and not status["worker_environment_exists"],
+    )
+
+    resp2, _ = zmq_request("environment_open")
+    assert resp2["success"] is True, pprint.pformat(resp2)
+    assert wait_for_condition(time=timeout_env_open, condition=condition_environment_created)
+    assert wait_for_condition(time=5, condition=lambda status: status["plans_allowed_uid"] != plans_allowed_uid)
+
+    # The plan runs longer than the cleanup after the killed process used to take (10 s).
+    item = {"name": "plan_sleep", "args": [12], "item_type": "plan"}
+    resp3, _ = zmq_request("queue_item_execute", {"item": item, "user": _user, "user_group": _user_group})
+    assert resp3["success"] is True, pprint.pformat(resp3)
+    assert wait_for_condition(
+        time=30,
+        condition=lambda status: status["items_in_history"] == 1 and status["manager_state"] == "idle",
+    )
+
+    resp4, _ = zmq_request("history_get")
+    (history_item,) = resp4["items"]
+    assert history_item["item_uid"] == resp3["item"]["item_uid"]
+    assert history_item["result"]["exit_status"] == "completed", pprint.pformat(history_item["result"])
+    assert get_manager_status()["worker_environment_exists"] is True
+
+    resp5, _ = zmq_request("environment_close")
+    assert resp5["success"] is True
+    assert wait_for_condition(time=5, condition=condition_environment_closed)
+
+
+
 # ======================================================================================
 #                           Method 're_pause'
 
